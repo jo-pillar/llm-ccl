@@ -1,0 +1,16 @@
+family=clos
+hosts=4
+gpus_per_host=2
+nics_per_host=1
+leaf_switches=2
+spine_switches=1
+collective=allgather
+message_size=4096
+host_bw_mbpus=0.15
+host_lat_us=3
+nic_bw_mbpus=0.0455
+nic_lat_us=0
+leaf_bw_mbpus=0.0455
+leaf_lat_us=10
+spine_bw_mbpus=0.36
+spine_lat_us=10
