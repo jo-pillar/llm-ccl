@@ -36,3 +36,16 @@ fn topodsl_params_update_flow_sim_config() {
     assert_eq!(cfg.coll_name, "allgather");
     assert_eq!(cfg.coll_bytes, 8192);
 }
+
+#[test]
+fn multirail_topodsl_params_update_flow_sim_config() {
+    let spec = load_topodsl("examples/topologies/multirail_2host.txt").unwrap();
+    let json = render_flow_sim_config(&spec.params, "allgather", 4096).unwrap();
+    let cfg = parse_config(json.as_bytes()).unwrap();
+
+    assert_eq!(cfg.topology, TopologyKind::Multirail);
+    assert_eq!(cfg.hosts.host_num, 2);
+    assert_eq!(cfg.hosts.gpus_per_host, 2);
+    assert_eq!(cfg.hosts.nics_per_host, 2);
+    assert_eq!(cfg.rail_count, 2);
+}
