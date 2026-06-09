@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use llm_ccl_agent::run::{self, RunOptions};
 
 #[derive(Debug, Parser)]
 #[command(about = "LLM-CCL Rust agent runner")]
@@ -21,10 +22,30 @@ enum Commands {
         rounds: usize,
         #[arg(long)]
         output: std::path::PathBuf,
+        #[arg(long)]
+        fake_llm: bool,
     },
 }
 
 fn main() -> Result<()> {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
+    if let Some(Commands::Run {
+        topo,
+        collective,
+        message_size,
+        rounds,
+        output,
+        fake_llm,
+    }) = cli.command
+    {
+        run::run(RunOptions {
+            topo,
+            collective,
+            message_size,
+            rounds,
+            output,
+            fake_llm,
+        })?;
+    }
     Ok(())
 }
