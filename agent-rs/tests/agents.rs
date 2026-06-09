@@ -1,6 +1,6 @@
 use llm_ccl_agent::{
     agents::build_proposal_prompt,
-    llm::{FakeLlmBackend, LlmBackend},
+    llm::{FakeLlmBackend, LlmBackend, OpenAiCompatibleBackend},
     topodsl::load_topodsl,
 };
 
@@ -27,4 +27,16 @@ fn fake_llm_returns_scripted_calls_with_token_metadata() {
     assert!(call.input_tokens.unwrap() > 0);
     assert!(call.output_tokens.unwrap() > 0);
     assert_eq!(call.completion, "[[[0,1,0,0,1]]]");
+}
+
+#[test]
+fn openai_compatible_backend_scaffold_has_clear_boundary() {
+    let mut backend = OpenAiCompatibleBackend::new("test-model");
+    let err = backend
+        .complete("proposal", 0, "prompt text")
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("not wired"));
+    assert!(err.contains("test-model"));
 }

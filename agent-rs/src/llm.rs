@@ -29,6 +29,28 @@ pub struct FakeLlmBackend {
     next_completion: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct OpenAiCompatibleBackend {
+    model_name: String,
+}
+
+impl OpenAiCompatibleBackend {
+    pub fn new(model_name: impl Into<String>) -> Self {
+        Self {
+            model_name: model_name.into(),
+        }
+    }
+}
+
+impl LlmBackend for OpenAiCompatibleBackend {
+    fn complete(&mut self, _agent_type: &str, _round_id: usize, _prompt: &str) -> Result<LlmCall> {
+        Err(anyhow!(
+            "OpenAI-compatible backend for model {} is not wired yet; use --fake-llm",
+            self.model_name
+        ))
+    }
+}
+
 impl FakeLlmBackend {
     pub fn new(completions: Vec<String>) -> Self {
         Self {
