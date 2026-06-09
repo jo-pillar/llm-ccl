@@ -1,5 +1,12 @@
 # Lightweight SyCCL Agent
 
+## Legacy SimpleTES Path
+
+This directory keeps the old SimpleTES-based SyCCL agent for reference and
+backward compatibility. The active LLM-CCL agent mainline is `../agent-rs`.
+New experiments should use the Rust runner; these commands are legacy and must
+not be used for the new two-agent feedback loop.
+
 This directory contains the extracted SimpleTES agent pieces needed for SyCCL
 algorithm search. The evaluator no longer calls SyCCL `resim` directly. It
 validates compact sketches, translates them into `candidate-translated.json`,
