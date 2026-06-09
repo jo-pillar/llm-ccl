@@ -1,0 +1,94 @@
+Optimize SyCCL direct-event sketch generation for a 4-host Clos allgather target.
+
+You are evolving Python code that returns candidate single-root broadcast sketches
+in a compact DSL. The target collective is allgather, but you do not write a full
+allgather schedule directly. Instead, your sketch describes how the chunk initially
+owned by GPU 0 should be broadcast to every other GPU. The evaluator expands that
+single-root broadcast tree into one analogous tree per source chunk/root GPU using
+topology-preserving rotations, then simulates the resulting full GPU-to-GPU
+allgather event schedule. This means a good compact tree must be fast for root 0
+and, more importantly, should create low contention after the same pattern is
+rotated across all 32 roots.
+
+The evaluator validates your DSL, converts valid sketches into SyCCL sketch JSON,
+expands them into allgather direct events, and runs a simulator. You only need to
+return candidate sketches; do not call the simulator yourself.
+
+Optimization objective:
+
+    combined_score = -best_time_us
+
+Higher `combined_score` is better. Because it is the negative of simulated time,
+the real objective is to minimize `best_time_us`, the best simulated allgather
+completion time in microseconds among the returned candidate sketches.
+
+Topology and link costs:
+- 32 GPUs total, root GPU is 0 for the compact broadcast sketch.
+- Hosts: 4 hosts, 8 GPUs per host.
+- Layer 1 is host-local NVLink (`bw_mbpus=0.3`, `lat_us=9`):
+  - group 0: GPUs 0..7
+  - group 1: GPUs 8..15
+  - group 2: GPUs 16..23
+  - group 3: GPUs 24..31
+- Layer 3 is the leaf Clos layer (`bw_mbpus=0.0225`, `lat_us=25`):
+  - group 0: GPUs 0..15
+  - group 1: GPUs 16..31
+- Layer 4 is the spine Clos layer (`bw_mbpus=0.36`, `lat_us=25`):
+  - group 0: GPUs 0..31
+
+Interpretation:
+- Layer 1 is relatively fast and should usually be used for host-local fanout.
+- Layer 3 has much lower bandwidth and nontrivial latency, so avoid creating a
+  rotated allgather pattern that overloads leaf links with many serialized sends.
+- Layer 4 has high bandwidth but still pays the 25 us cross-switch latency, so it
+  is useful for broad cross-host reach but should not be used blindly for every
+  small dependency if the added latency increases the critical path.
+
+Required return format:
+- Implement `construct_sketches()`.
+- Return either one sketch or a list of sketches.
+- Return at most 6 sketches.
+- A sketch is a list of compact transmissions.
+- Preferred compact transmission form:
+
+```python
+(step, layer, group, srcs, dsts)
+```
+
+- `srcs` and `dsts` may each be a single GPU id or a list of GPU ids.
+- If `srcs` contains multiple GPUs, all listed sources must already have the chunk
+  before this step. During direct-event expansion, destinations in that
+  transmission are assigned across the listed sources in order, which can express
+  parallel fanout from several relays inside one layer/group.
+- Dict form is also accepted:
+
+```python
+{"step": 0, "layer": 1, "group": 0, "srcs": [0], "dsts": [1, 2, 3]}
+```
+
+Validity constraints:
+- Use only layers 1, 3, and 4.
+- A transmission's srcs and dsts must all be inside the specified layer/group.
+- GPU ids must be integers in 0..31.
+- GPU 0 starts with the root chunk.
+- Every GPU 1..31 must be reached exactly once; GPU 0 must not appear as a dst.
+- A GPU may be used as a source only after it has received the chunk in an earlier step, except GPU 0.
+- Dependent steps must be strictly increasing. Same-step forwarding through a newly reached GPU is invalid.
+- No transmission may have duplicate dst ids, and no sketch may deliver to the same dst twice.
+
+
+Design guidance:
+- Think in two stages: first design an efficient broadcast tree for chunk 0, then reason about what happens when the same tree is rotated to all 32 chunks for allgather. 
+- Try different relay GPUs, fanout timing, and dependency depths.
+- Consider using multiple already-reached relays as `srcs` for a later fanout 
+- ONLY return ONE sketch one time.
+
+Evaluator metrics:
+- `combined_score`: the only score to maximize; equals `-best_time_us`.
+- `validity`: 1.0 for a valid sketch that simulates successfully, 0.0 otherwise.
+- `best_time_us`: primary performance value to minimize; simulated allgather time.
+- `critical_link_path`: a source-to-destination chain ending at the last simulated receive; use it as a bottleneck clue, not as the score.
+- `critical_link_queue_wait_ns`: time spent waiting behind other traffic on the critical-link trace; high values suggest contention from the rotated allgather.
+- `critical_link_latency_ns`: fixed per-hop latency on that trace; high values suggest too many latency-heavy cross-layer hops on the critical path.
+- `critical_link_beta_cost_ns`: bandwidth/data-transfer cost on that trace; 
+- `critical_link_total_ns`: sum of queue wait, latency, and beta cost for the reported critical-link trace. It is diagnostic only; optimize `best_time_us`.
