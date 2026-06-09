@@ -9,6 +9,7 @@ use crate::{
     evaluator::{enumerate_small_scale_sketches, EvaluationMetrics},
     llm::{FakeLlmBackend, LlmBackend},
     records::{LlmCallRecord, RoundRecord, RunRecorder},
+    sketch_dsl::canonicalize_sketch_dsl,
     topodsl::load_topodsl,
 };
 
@@ -59,8 +60,9 @@ fn run_fake_llm(options: RunOptions) -> Result<()> {
             &exploration_records,
         );
         let call = llm.complete("proposal", round_id, &prompt)?;
+        let candidate_sketch = canonicalize_sketch_dsl(&call.completion)?;
         let (metrics, translated_json) =
-            evaluate_candidate_with_translated(&config_json, &call.completion)?;
+            evaluate_candidate_with_translated(&config_json, &candidate_sketch)?;
         let best_so_far = metrics.completion_time_us < best_completion_time_us;
         if best_so_far {
             best_completion_time_us = metrics.completion_time_us;
@@ -75,7 +77,7 @@ fn run_fake_llm(options: RunOptions) -> Result<()> {
             prompt_hash: call.prompt_hash.clone(),
             input_tokens: call.input_tokens.unwrap_or_default(),
             output_tokens: call.output_tokens.unwrap_or_default(),
-            candidate_sketch: call.completion.clone(),
+            candidate_sketch,
             validity_status: metrics.validity_status.clone(),
             expanded_events: metrics.expanded_events,
             completion_time: metrics.completion_time_us,

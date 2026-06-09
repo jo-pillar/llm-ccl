@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use crate::sketch_dsl::canonicalize_sketch_dsl;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvaluationMetrics {
     pub validity_status: String,
@@ -27,6 +29,7 @@ pub fn enumerate_small_scale_sketches(
 }
 
 pub fn evaluate_sketch_json(config_json: &str, sketch_json: &str) -> Result<EvaluationMetrics> {
+    let sketch_json = canonicalize_sketch_dsl(sketch_json)?;
     let config = flow_sim_rs::config::parse_config(config_json.as_bytes())
         .context("failed to parse flow-sim config")?;
     let sketches = flow_sim_rs::sketch::parse_compact_sketches(sketch_json.as_bytes(), &config)

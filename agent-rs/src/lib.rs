@@ -4,4 +4,5 @@ pub mod evaluator;
 pub mod llm;
 pub mod records;
 pub mod run;
+pub mod sketch_dsl;
 pub mod topodsl;
