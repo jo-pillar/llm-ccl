@@ -7,9 +7,13 @@ the existing SimpleTES Python implementation available as a legacy path. The new
 default workflow must not invoke SimpleTES inspiration selection, multi-chain
 exploration, Python code evolution, or `agent/main.py`.
 
-The acceptance target is an end-to-end run for one topology scale, one message
-size, and `allgather`, with exactly 10 LLM interaction rounds and a final
-generated algorithm candidate evaluated by the deterministic toolchain.
+The mainline target is defined by the minimal end-to-end tests in this spec.
+The implementation is acceptable only when those tests pass. The core acceptance
+test is a fake-LLM end-to-end run for one supported topology family, one scale,
+one message size, and `allgather`, where the Rust runner executes exactly 10
+target search rounds, evaluates at least one valid candidate with
+`Flow-Simulator/flow-sim-rs`, writes the required raw records, and returns the
+best candidate artifacts.
 
 ## Non-Goals
 
@@ -32,7 +36,7 @@ cargo run --manifest-path agent-rs/Cargo.toml -- \
   --collective allgather \
   --message-size 4096 \
   --rounds 10 \
-  --output /tmp/llm-ccl-run
+  --output ./result/llm-ccl-run
 ```
 
 SimpleTES remains callable only through its old explicit commands. New docs and
@@ -44,30 +48,36 @@ TopoDSL should be easy for users to edit directly. The runner will support two
 forms:
 
 1. Python topology spec files.
-   - A Python file exposes a small function, for example `build_topology()`,
-     returning JSON-serializable topology data.
-   - This is the preferred path for parameterized topologies and scale-down
-     generation.
-   - Rust executes the Python file in a controlled subprocess and reads one JSON
-     object from stdout.
+   - This is the preferred and prompt-facing TopoDSL.
+   - The LLM receives topology context as Python code, not JSON. The code should
+     describe topology family and parameters in an editable, compact form.
+   - The Rust runner may execute or parse this Python file in a controlled
+     subprocess to extract a small parameter object, but the prompt should keep
+     the Python-code representation.
 
 2. Plain text topology spec files.
    - A simple line-oriented format for quick edits.
-   - The parser accepts key-value fields for hosts, GPUs per host, collective,
-     message size, layers, groups, bandwidth, and latency.
-   - The parsed result is normalized into the same internal topology model used
-     by Python specs.
+   - The parser accepts key-value fields for topology family, hosts, GPUs per
+     host, NICs, switches, collective, message size, bandwidth, and latency.
+   - The parsed result is normalized into the same internal topology parameters
+     used by Python specs.
 
-Both forms compile into one canonical internal `TopologySpec` and then into the
-SyCCL/flow-sim config shape. The canonical topology object includes a stable
-hash used as `topodsl_config_id` in experiment records.
+Both forms compile into one canonical internal `TopologyParams` object. This
+phase only supports the topology families already supported by the current
+pipeline: `multirail` and `clos`. The runner maps TopoDSL parameters onto the
+corresponding SyCCL/`Flow-Simulator/flow-sim-rs` config fields. The flow
+simulator is not required to generate a network topology directly from TopoDSL;
+it only needs to receive adjusted config parameters for the supported topology
+families. The canonical parameter object includes a stable hash used as
+`topodsl_config_id` in experiment records.
 
 ## Architecture
 
 The new Rust implementation has five bounded components:
 
 - `topodsl`: load Python or text topology specs, normalize them, generate
-  scale-down variants, and emit SyCCL/flow-sim compatible configs.
+  scale-down parameter variants, and emit adjusted SyCCL/flow-sim compatible
+  configs for `multirail` and `clos`.
 - `sketch_search`: call `syccl-sketch-search` as a Rust library for exhaustive
   small-scale root-sketch enumeration. This module is the meaning of "sketch
   exhaustive search" in this workflow.
@@ -86,9 +96,11 @@ reuse without increasing risk.
 
 ## Data Flow
 
-1. Load TopoDSL from Python or plain text.
-2. Compile it into the canonical topology model and the concrete target config.
-3. Run a topology sanity check before any LLM calls.
+1. Load TopoDSL from Python code or plain text.
+2. Compile it into canonical topology parameters and the concrete target config
+   for one supported topology family.
+3. Run a topology sanity check against the generated flow-sim config before any
+   LLM calls.
 4. Find a smaller same-family topology where exhaustive sketch search finishes
    within the configured budget.
 5. Call `syccl-sketch-search` on that small topology and evaluate the enumerated
@@ -114,7 +126,7 @@ reuse without increasing risk.
 
 The proposal agent only generates root-level SketchDSL. It receives:
 
-- target topology summary and layer/group semantics;
+- target TopoDSL as Python-code context plus derived layer/group semantics;
 - collective type and message size;
 - SketchDSL syntax constraints;
 - small-scale enumeration records;
@@ -209,9 +221,10 @@ but should always record hashes and token counts for experiment reproducibility.
 
 The implementation should be test-driven. Required focused tests:
 
-- Python TopoDSL compiles into canonical topology and SyCCL/flow-sim config.
-- Plain-text TopoDSL compiles into the same canonical shape for a small Clos
-  topology.
+- Python TopoDSL compiles into canonical topology parameters and adjusted
+  SyCCL/flow-sim config.
+- Plain-text TopoDSL compiles into the same canonical parameter shape for a
+  small Clos topology.
 - The Rust runner invokes `syccl-sketch-search` for small-scale enumeration.
 - Fake proposal agent plus fake record agent run exactly 10 target rounds.
 - A valid allgather candidate for one small topology and one message size
@@ -223,6 +236,31 @@ The implementation should be test-driven. Required focused tests:
   the experiment plan.
 - Legacy SimpleTES tests remain runnable but are not part of the new default
   acceptance path.
+
+## Minimal End-to-End Acceptance Tests
+
+The mainline target is satisfied by these tests, not by a manual demo:
+
+- `test_minimal_allgather_fake_llm_10_rounds`: runs the Rust runner with a
+  fake proposal agent and fake record agent on one `clos` or `multirail`
+  TopoDSL Python file, one message size, and `allgather`; asserts exactly 10
+  target search rounds, no SimpleTES process or module path is invoked, at
+  least one candidate is valid, flow-sim returns positive completion time, and
+  `best_sketch.json`, `best_translated.json`, `rounds.jsonl`,
+  `llm_calls.jsonl`, and `summary.json` are written.
+- `test_topodsl_python_code_is_prompt_context`: builds the first proposal prompt
+  from a Python-code TopoDSL file and asserts the prompt contains the Python DSL
+  text rather than a JSON topology dump.
+- `test_topodsl_params_update_flow_sim_config`: compiles `clos` and `multirail`
+  TopoDSL parameters into existing flow-sim config shapes and asserts only the
+  corresponding supported parameters, such as host count, GPUs per host, NICs,
+  switches, link bandwidth, latency, collective, and message size, are changed.
+- `test_record_agent_summary_and_direction`: feeds deterministic round outcomes
+  to the record agent and asserts it updates the rolling summary and emits a
+  new direction hint after stagnation or duplicate-like candidates.
+- `test_experiment_plan_raw_records`: inspects `rounds.jsonl` and
+  `llm_calls.jsonl` from the fake end-to-end run and asserts all fields required
+  by `cclpaper/experiment_plan.md` are present.
 
 ## Migration Plan
 
