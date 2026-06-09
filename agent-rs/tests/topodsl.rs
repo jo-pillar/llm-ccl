@@ -1,6 +1,6 @@
-use llm_ccl_agent::topodsl::load_topodsl;
 use flow_sim_rs::config::{parse_config, TopologyKind};
 use llm_ccl_agent::config_render::render_flow_sim_config;
+use llm_ccl_agent::topodsl::load_topodsl;
 
 #[test]
 fn topodsl_python_code_is_preserved_for_prompt() {

@@ -16,7 +16,11 @@ pub fn render_flow_sim_config(
     serde_json::to_string_pretty(&value).map_err(Into::into)
 }
 
-fn render_clos(params: &TopologyParams, collective: &str, message_size: u64) -> Result<serde_json::Value> {
+fn render_clos(
+    params: &TopologyParams,
+    collective: &str,
+    message_size: u64,
+) -> Result<serde_json::Value> {
     let leaf_switches = params
         .leaf_switches
         .ok_or_else(|| anyhow!("clos TopoDSL requires leaf_switches"))?;

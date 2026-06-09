@@ -7,13 +7,7 @@ use llm_ccl_agent::{
 #[test]
 fn topodsl_python_code_is_prompt_context() {
     let spec = load_topodsl("examples/topologies/clos_4host.py").unwrap();
-    let prompt = build_proposal_prompt(
-        &spec,
-        "allgather",
-        4096,
-        "try fewer cross-host sends",
-        &[],
-    );
+    let prompt = build_proposal_prompt(&spec, "allgather", 4096, "try fewer cross-host sends", &[]);
 
     assert!(prompt.contains("[TopoDSL Python Code]"));
     assert!(prompt.contains("```python"));

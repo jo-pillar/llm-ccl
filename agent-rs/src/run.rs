@@ -38,7 +38,10 @@ fn run_fake_llm(options: RunOptions) -> Result<()> {
     flow_sim_rs::config::parse_config(config_json.as_bytes())
         .context("rendered flow-sim config is invalid")?;
 
-    let run_id = format!("{}-{}-{}", spec.topodsl_config_id, options.collective, options.message_size);
+    let run_id = format!(
+        "{}-{}-{}",
+        spec.topodsl_config_id, options.collective, options.message_size
+    );
     let mut recorder = RunRecorder::new(&options.output, &run_id)?;
     let small_scale_records = summarize_small_scale_search(&config_json)?;
     let mut exploration_records = small_scale_records;
