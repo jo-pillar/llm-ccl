@@ -13,16 +13,6 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from datasets.syccl.common.config import (
-  SycclConfigContext,
-  derive_layer_groups,
-  load_syccl_config,
-)
-from datasets.syccl.common.sketch import (
-  SketchValidationError,
-  normalize_sketches as normalize_common_sketches,
-)
-
 try:
   from simpletes.construction import capture_construction_if_requested
 except Exception:  # pragma: no cover - evaluator also works outside SimpleTES
@@ -31,44 +21,12 @@ except Exception:  # pragma: no cover - evaluator also works outside SimpleTES
 
 
 AGENT_ROOT = Path(__file__).resolve().parents[3]
-WORKSPACE_ROOT = AGENT_ROOT.parent
-
-
-def _resolve_syccl_root() -> Path:
-  raw_path = os.environ.get("SYCCL_REPO_ROOT")
-  if raw_path:
-    return Path(raw_path).expanduser().resolve()
-  if (WORKSPACE_ROOT / "syccl" / "config").exists():
-    return WORKSPACE_ROOT / "syccl"
-  return WORKSPACE_ROOT
-
-
-REPO_ROOT = _resolve_syccl_root()
+REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_BASE_CONFIG = REPO_ROOT / "config" / "a100-8gpu-4nic-clos-ag-4k.json"
 FALLBACK_BASE_CONFIG = REPO_ROOT / "config" / "a100-8gpu-4nic-clos-ag.json"
 SYNTHESIZE_BIN = REPO_ROOT / "build" / "synthesize"
 SCHEME_NAME = "scheme1_direct_events"
 DEFAULT_ARTIFACT_ROOT = AGENT_ROOT / "eval_artifacts"
-
-
-def _resolve_flow_sim_root() -> Path:
-  raw_path = os.environ.get("SYCCL_FLOW_SIM_ROOT")
-  if raw_path:
-    return Path(raw_path).expanduser().resolve()
-  if (WORKSPACE_ROOT / "Flow-Simulator" / "flow-sim-rs").exists():
-    return WORKSPACE_ROOT / "Flow-Simulator" / "flow-sim-rs"
-  return WORKSPACE_ROOT / "flow-sim-rs"
-
-
-FLOW_SIM_ROOT = _resolve_flow_sim_root()
-FLOW_SIM_BIN = Path(os.environ.get(
-    "SYCCL_FLOW_SIM_BIN",
-    str(FLOW_SIM_ROOT / "target" / "release" / "flow-sim-rs"),
-)).expanduser()
-EVAL_ARTIFACT_ROOT = Path(os.environ.get(
-    "SYCCL_EVAL_ARTIFACT_DIR",
-    str(DEFAULT_ARTIFACT_ROOT),
-)).expanduser()
 
 MAX_SKETCHES = int(os.environ.get("SYCCL_MAX_CANDIDATE_SKETCHES", "6"))
 MAX_STEP = int(os.environ.get("SYCCL_MAX_SKETCH_STEP", "31"))
@@ -163,6 +121,50 @@ def _derive_upper_pod_switch_groups(
     for group in ordered_lower[switch_id * lower_per_switch:(switch_id + 1) * lower_per_switch]:
       members.update(group)
     groups[switch_id] = members
+  return groups
+
+
+def derive_layer_groups(config: dict[str, Any]) -> dict[int, dict[int, set[int]]]:
+  hosts = config.get("hosts", {})
+  host_num = int(hosts.get("host_num", 0))
+  host_gpu_num = int(hosts.get("host_gpu_num", 0))
+  host_nic_num = int(hosts.get("host_nic_num", 0))
+  if host_num <= 0 or host_gpu_num <= 0:
+    raise ValueError("config hosts.host_num and hosts.host_gpu_num must be positive")
+
+  groups: dict[int, dict[int, set[int]]] = {}
+  prev_layer_type = ""
+  prev_layer_id: int | None = None
+  for layer in config.get("topo", []):
+    layer_id = int(layer["layer_id"])
+    layer_type = layer.get("type")
+    if layer_type == "host":
+      groups[layer_id] = {
+        host: _host_range(host, host_gpu_num)
+        for host in range(host_num)
+      }
+    elif layer_type == "switch":
+      switch_num = int(layer["switch_num"])
+      switch_topo = layer.get("switch_topo")
+      if prev_layer_type == "nic":
+        if switch_topo == "multirail":
+          groups[layer_id] = _derive_multirail_groups(
+              host_num=host_num,
+              host_gpu_num=host_gpu_num,
+              host_nic_num=host_nic_num,
+              switch_num=switch_num,
+          )
+        elif switch_topo == "pod":
+          groups[layer_id] = _derive_first_pod_switch_groups(
+              host_num=host_num,
+              host_gpu_num=host_gpu_num,
+              switch_num=switch_num,
+          )
+      elif prev_layer_type == "switch" and prev_layer_id in groups:
+        if switch_topo == "pod":
+          groups[layer_id] = _derive_upper_pod_switch_groups(groups[prev_layer_id], switch_num)
+    prev_layer_type = str(layer_type)
+    prev_layer_id = layer_id
   return groups
 
 
@@ -315,21 +317,17 @@ TASK_HOST_GPU_NUM = int(BASE_CONFIG_DATA.get("hosts", {}).get("host_gpu_num", 8)
 TASK_HOST_NIC_NUM = int(BASE_CONFIG_DATA.get("hosts", {}).get("host_nic_num", 4))
 NGPUS = TASK_HOST_NUM * TASK_HOST_GPU_NUM
 LAYER_GROUPS = derive_layer_groups(BASE_CONFIG_DATA)
-CONFIG_CONTEXT = load_syccl_config(BASE_CONFIG) if BASE_CONFIG.exists() else SycclConfigContext(
-    path=BASE_CONFIG,
-    data=BASE_CONFIG_DATA,
-    host_num=TASK_HOST_NUM,
-    host_gpu_num=TASK_HOST_GPU_NUM,
-    host_nic_num=TASK_HOST_NIC_NUM,
-    ngpus=NGPUS,
-    collective=str(BASE_CONFIG_DATA.get("coll", {}).get("name", "allgather")),
-    coll_byte=int(BASE_CONFIG_DATA.get("coll", {}).get("byte", 4096)),
-    layer_groups=LAYER_GROUPS,
-)
+
+
+class SketchValidationError(ValueError):
+  """Raised when a generated sketch cannot be safely sent to SyCCL."""
 
 
 def _resolve_artifact_root() -> Path:
-  path = EVAL_ARTIFACT_ROOT
+  raw_path = os.environ.get("SYCCL_EVAL_ARTIFACT_DIR")
+  if not raw_path:
+    return DEFAULT_ARTIFACT_ROOT
+  path = Path(raw_path)
   if not path.is_absolute():
     path = AGENT_ROOT / path
   return path
@@ -771,24 +769,77 @@ def _build_graph(transmissions: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _normalize_sketches(raw: Any) -> list[dict[str, Any]]:
-  return normalize_common_sketches(
-      raw,
-      CONFIG_CONTEXT,
-      max_sketches=MAX_SKETCHES,
-      max_step=MAX_STEP,
-  )
+  if _looks_like_native_sketch(raw):
+    candidates = [raw]
+  elif _looks_like_transmission(raw):
+    raise SketchValidationError(
+        "run_code() must return a sketch list, not one bare transmission"
+    )
+  elif isinstance(raw, (list, tuple)) and raw and all(
+      _looks_like_native_sketch(item) for item in raw
+  ):
+    candidates = list(raw)
+  elif _looks_like_transmission_list(raw):
+    candidates = [raw]
+  elif isinstance(raw, (list, tuple)):
+    candidates = list(raw)
+  else:
+    raise SketchValidationError(
+        "run_code() must return one sketch or a list of sketches"
+    )
+
+  if not candidates:
+    raise SketchValidationError("no sketches returned")
+  if len(candidates) > MAX_SKETCHES:
+    raise SketchValidationError(
+        f"too many sketches returned: {len(candidates)} > {MAX_SKETCHES}"
+    )
+
+  graphs = []
+  seen = set()
+  for candidate in candidates:
+    transmissions = _normalize_candidate(candidate)
+    graph = _build_graph(transmissions)
+    fingerprint = json.dumps(graph["nodes"], sort_keys=True)
+    if fingerprint in seen:
+      continue
+    seen.add(fingerprint)
+    graphs.append(graph)
+
+  if not graphs:
+    raise SketchValidationError("all sketches were duplicates")
+  return graphs
 
 
 def _write_eval_files(
-    raw_sketches: Any,
+    sketches: list[dict[str, Any]],
     workdir: Path,
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path]:
   sketch_path = workdir / "candidate-sketch.json"
-  result_path = workdir / "candidate-flow-sim.json"
-  log_path = workdir / "candidate-flow-sim.log"
+  config_path = workdir / "candidate-config.json"
+  result_path = workdir / "candidate-resim.json"
+  translated_path = workdir / "candidate-translated.json"
+  log_path = workdir / "candidate-resim.log"
 
-  sketch_path.write_text(json.dumps(raw_sketches, indent=2), encoding="utf-8")
-  return sketch_path, result_path, log_path
+  with BASE_CONFIG.open("r", encoding="utf-8") as f:
+    config = json.load(f)
+
+  host_gpu_num = int(config.get("hosts", {}).get("host_gpu_num", 0))
+  if host_gpu_num <= 0 or NGPUS % host_gpu_num != 0:
+    raise SketchValidationError(
+        f"base config host_gpu_num={host_gpu_num} is incompatible with {NGPUS} GPUs"
+    )
+  config["hosts"]["host_num"] = NGPUS // host_gpu_num
+
+  config.setdefault("sketch", {})
+  config["sketch"]["customize_sketch"] = False
+  config["sketch"]["use_sketch_input"] = True
+  config["sketch"]["save_sketch"] = False
+  config["sketch"]["sketch_path"] = str(sketch_path)
+
+  sketch_path.write_text(json.dumps(sketches, indent=2), encoding="utf-8")
+  config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+  return config_path, sketch_path, result_path, translated_path, log_path
 
 
 def _run_syccl(
@@ -817,66 +868,6 @@ def _run_syccl(
       ],
       cwd=str(REPO_ROOT),
       env=env,
-      stdout=subprocess.PIPE,
-      stderr=subprocess.STDOUT,
-      text=True,
-      timeout=TIMEOUT_SECONDS,
-      check=False,
-  )
-  wall = time.time() - start
-  log_path.write_text(proc.stdout, encoding="utf-8", errors="replace")
-  return proc.returncode, wall, proc.stdout
-
-
-def _run_flow_sim(
-    config_path: Path,
-    translated_path: Path,
-    result_path: Path,
-    log_path: Path,
-) -> tuple[int, float, str]:
-  start = time.time()
-  proc = subprocess.run(
-      [
-        str(FLOW_SIM_BIN),
-        "simulate",
-        "--config",
-        str(config_path),
-        "--translated",
-        str(translated_path),
-        "--output",
-        str(result_path),
-      ],
-      cwd=str(FLOW_SIM_ROOT),
-      stdout=subprocess.PIPE,
-      stderr=subprocess.STDOUT,
-      text=True,
-      timeout=TIMEOUT_SECONDS,
-      check=False,
-  )
-  wall = time.time() - start
-  log_path.write_text(proc.stdout, encoding="utf-8", errors="replace")
-  return proc.returncode, wall, proc.stdout
-
-
-def _run_flow_sim_sketch(
-    config_path: Path,
-    sketch_path: Path,
-    result_path: Path,
-    log_path: Path,
-) -> tuple[int, float, str]:
-  start = time.time()
-  proc = subprocess.run(
-      [
-        str(FLOW_SIM_BIN),
-        "simulate-sketch",
-        "--config",
-        str(config_path),
-        "--sketch",
-        str(sketch_path),
-        "--output",
-        str(result_path),
-      ],
-      cwd=str(FLOW_SIM_ROOT),
       stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT,
       text=True,
@@ -1093,49 +1084,14 @@ def _critical_link_summary(result: dict[str, Any]) -> dict[str, Any]:
   return metrics
 
 
-def _flow_sim_summary(result: dict[str, Any]) -> dict[str, Any]:
-  metrics = _empty_bottleneck_metrics()
-  links = result.get("links")
-  if isinstance(links, list) and links:
-    critical = max(
-        (link for link in links if isinstance(link, dict)),
-        key=lambda link: int(link.get("queue_wait_ns", 0)) + int(link.get("busy_ns", 0)),
-        default=None,
-    )
-    if critical is not None:
-      metrics["critical_link_path"] = f"{critical.get('src', '')}->{critical.get('dst', '')}"
-      metrics["critical_link_hop_count"] = 1
-      metrics["critical_link_queue_wait_ns"] = int(critical.get("queue_wait_ns", 0))
-      metrics["critical_link_beta_cost_ns"] = int(critical.get("busy_ns", 0))
-      total = metrics["critical_link_queue_wait_ns"] + metrics["critical_link_beta_cost_ns"]
-      metrics["critical_link_total_ns"] = total
-      if total > 0:
-        metrics["critical_link_queue_wait_pct"] = metrics["critical_link_queue_wait_ns"] * 100.0 / total
-        metrics["critical_link_beta_cost_pct"] = metrics["critical_link_beta_cost_ns"] * 100.0 / total
-  for key in (
-      "finish_time_ns",
-      "flow_count",
-      "channel_count",
-      "total_queue_wait_ns",
-      "max_source_cross_epoch_fanout",
-      "source_cross_epoch_pressure_ns",
-      "max_epoch",
-      "epoch_barrier_ns",
-      "critical_flow_id",
-  ):
-    if key in result:
-      metrics[key] = result[key]
-  return metrics
-
-
 def evaluate(program_path: str) -> dict[str, Any]:
-  """Evaluate a generated SimpleTES program with the Rust flow simulator."""
+  """Evaluate a generated SimpleTES program via direct SyCCL resim."""
   workdir: Path | None = None
   try:
     if not BASE_CONFIG.exists():
       return _error_result(f"missing base config: {BASE_CONFIG}")
-    if not FLOW_SIM_BIN.exists():
-      return _error_result(f"missing flow-sim binary: {FLOW_SIM_BIN}")
+    if not SYNTHESIZE_BIN.exists():
+      return _error_result(f"missing SyCCL binary: {SYNTHESIZE_BIN}")
 
     workdir = _make_eval_workdir()
     _copy_program(program_path, workdir)
@@ -1145,26 +1101,33 @@ def evaluate(program_path: str) -> dict[str, Any]:
       return _write_metrics(workdir, _error_result("program must define run_code()"))
 
     raw = module.run_code()
-    sketch_path, result_path, log_path = _write_eval_files(raw, workdir)
+    sketches = _normalize_sketches(raw)
+    total_nodes = sum(len(sketch["nodes"]) for sketch in sketches)
+
+    config_path, sketch_path, result_path, translated_path, log_path = _write_eval_files(
+        sketches,
+        workdir,
+    )
     try:
-      returncode, wall, log = _run_flow_sim_sketch(
-          BASE_CONFIG,
+      returncode, wall, log = _run_syccl(
+          config_path,
           sketch_path,
           result_path,
+          translated_path,
           log_path,
       )
     except subprocess.TimeoutExpired:
       return _write_metrics(workdir, _error_result(
-          f"flow-sim timed out after {TIMEOUT_SECONDS}s",
+          f"SyCCL direct resim timed out after {TIMEOUT_SECONDS}s",
       ))
 
     if returncode != 0:
       return _write_metrics(workdir, _error_result(
-          f"flow-sim exited with code {returncode}: {_preview(log)}",
+          f"SyCCL direct resim exited with code {returncode}: {_preview(log)}",
       ))
     if not result_path.exists():
       return _write_metrics(workdir, _error_result(
-          f"flow-sim did not produce {result_path.name}; log={_preview(log)}",
+          f"SyCCL direct resim did not produce {result_path.name}; log={_preview(log)}",
       ))
 
     try:
@@ -1172,23 +1135,30 @@ def evaluate(program_path: str) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
       preview = _preview(result_path.read_text(encoding="utf-8", errors="replace"))
       return _write_metrics(workdir, _error_result(
-          f"invalid flow-sim JSON: {exc}; preview={preview}",
+          f"invalid SyCCL resim JSON: {exc}; preview={preview}",
       ))
 
     best_time = _extract_best_time_us(result)
     if best_time is None:
       preview = _preview(json.dumps(result, sort_keys=True)[:LOG_PREVIEW_CHARS])
       return _write_metrics(workdir, _error_result(
-          f"flow-sim output has no positive time field; preview={preview}; log={_preview(log)}",
+          f"resim output has no positive time field; preview={preview}; log={_preview(log)}",
       ))
 
-    capture_construction_if_requested(raw)
+    bottleneck_metrics: dict[str, Any]
+    try:
+      bottleneck_metrics = _critical_link_summary(result)
+    except (ValueError, KeyError, TypeError) as exc:
+      bottleneck_metrics = _empty_bottleneck_metrics()
+      bottleneck_metrics["critical_link_error"] = str(exc)
+
+    capture_construction_if_requested(sketches)
     metrics = {
       "combined_score": -float(best_time),
       "validity": 1.0,
       "best_time_us": float(best_time),
     }
-    metrics.update(_flow_sim_summary(result))
+    metrics.update(bottleneck_metrics)
     return _write_metrics(workdir, metrics)
 
   except SketchValidationError as exc:
