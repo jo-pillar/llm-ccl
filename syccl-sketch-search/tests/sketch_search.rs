@@ -203,6 +203,37 @@ fn cli_profiles_without_emitting_sketch_json() {
 }
 
 #[test]
+fn cli_prints_compact_dsl_to_terminal_without_replacing_json_output() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("config.json");
+    let output_path = temp.path().join("sketches.json");
+    std::fs::write(&config_path, tiny_single_host_config()).expect("write config");
+
+    let assert = Command::cargo_bin("syccl-sketch-search")
+        .expect("binary")
+        .args([
+            "--config",
+            config_path.to_str().expect("config path"),
+            "--output",
+            output_path.to_str().expect("output path"),
+            "--limit",
+            "1",
+            "--print-compact-dsl",
+        ])
+        .assert()
+        .success()
+        .stdout("");
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf8 stderr");
+    assert!(stderr.contains("compact_sketches = ["), "{stderr}");
+    assert!(stderr.contains("(0, 1, 0, 0,"), "{stderr}");
+
+    let output = std::fs::read_to_string(output_path).expect("read output");
+    let sketches: serde_json::Value = serde_json::from_str(&output).expect("json output");
+    assert!(sketches.as_array().is_some());
+}
+
+#[test]
 fn source_group_special_pruning_does_not_underflow_on_clos_config() {
     let config = parse_config(tiny_clos_config());
     let (sketches, _stats) = search_sketches(

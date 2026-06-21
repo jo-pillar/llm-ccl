@@ -3,7 +3,9 @@ use std::{fs, path::PathBuf};
 use anyhow::Context;
 use clap::Parser;
 use serde::Serialize;
-use syccl_sketch_search::{search_sketches_profiled, SearchOptions, SycclConfig};
+use syccl_sketch_search::{
+    format_compact_dsl, search_sketches_profiled, SearchOptions, SycclConfig,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Generate SyCCL single-root sketch candidates")]
@@ -28,6 +30,9 @@ struct Args {
 
     #[arg(long)]
     threads: Option<usize>,
+
+    #[arg(long)]
+    print_compact_dsl: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -69,6 +74,10 @@ fn main() -> anyhow::Result<()> {
         }
         json_ms
     };
+
+    if args.print_compact_dsl {
+        eprint!("{}", format_compact_dsl(&result.sketches));
+    }
 
     if args.profile {
         let profile = ProfileOutput {

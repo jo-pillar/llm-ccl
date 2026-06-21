@@ -1,0 +1,16 @@
+CURRENT TARGET CONTEXT:
+- message_size_bytes: {message_size}
+- derived topology summary: {topo_summary}
+Layer/group semantics:
+{layer_summary}
+
+Valid compact SketchDSL seed for format and feasibility reference:
+{seed_hint}
+
+{enumeration_note}
+
+Rolling record summary:
+{record_summary}
+
+Direction hint:
+{direction_hint}

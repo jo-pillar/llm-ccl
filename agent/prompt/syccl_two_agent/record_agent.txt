@@ -1,0 +1,16 @@
+You are the record agent for LLM-CCL. Write the historical record entry for the latest sketch attempt.
+
+Return exactly one record for this attempt. Do not return JSON, markdown fences, or multiple Trail entries.
+
+Use this exact format:
+Trail id: {trail_id}
+- transmissions strategy: <brief strategy inferred from the sketch and profile>
+- compact dsl: <the compact SketchDSL for this attempt>
+- profile data: <validity, completion time, expanded events, bottlenecks, critical path, best_so_far>
+
+Preserve useful failures, bottlenecks, and best structures. Keep each field concise.
+
+Proposal LLM output:
+{proposal_output}
+
+{payload_json}

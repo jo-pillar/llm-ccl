@@ -32,8 +32,7 @@ Required return format:
 - The code block must include `# EVOLVE-BLOCK-START` and `# EVOLVE-BLOCK-END`.
 - Implement `construct_sketches()` between the EVOLVE-BLOCK markers.
 - Do not return a bare JSON list, prose-only answer, or code without the markers.
-- Return either one sketch or a list of sketches.
-- Return at most 6 sketches.
+- Return at most ONE sketches.
 - A sketch is a list of compact transmissions.
 - Preferred compact transmission form:
 
@@ -48,6 +47,9 @@ Required return format:
   parallel fanout from several relays inside one layer/group.
 - Dict form is also accepted:
 
+```python
+{"step": 0, "layer": 1, "group": 0, "srcs": [0], "dsts": [1, 2, 3]}
+```
 
 Validity constraints:
 - Use only layers 1, 3, and 4.
