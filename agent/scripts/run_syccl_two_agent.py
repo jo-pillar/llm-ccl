@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -22,11 +23,13 @@ DEFAULT_ENV_TOML = AGENT_ROOT / "env.toml"
 
 
 def load_env_toml(path: str | Path | None) -> dict[str, str]:
-    if path is None or tomllib is None:
+    if path is None:
         return {}
+    if tomllib is None:
+        raise RuntimeError("tomllib is required to load --env-toml on this Python version")
     env_path = Path(path).expanduser()
     if not env_path.exists():
-        return {}
+        raise FileNotFoundError(f"env.toml not found: {env_path}")
     data = tomllib.loads(env_path.read_text(encoding="utf-8"))
     return {key: str(value) for key, value in data.items() if key in {"model", "api_base", "api_key"} and value}
 
@@ -65,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         init_eval_repeats=1,
         output_path=str(output_dir / "checkpoints"),
         save_llm_io=args.save_llm_io,
-        log_interval=1,
+        log_interval=1024,
         db_show_interval=1,
         num_inspirations=0,
         num_chains=1,
@@ -87,10 +90,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     engine = SimpleTESEngine(config, runtime=runtime)
     asyncio.run(engine.run())
-    print(f"instance_id={engine.instance_id}")
-    print(f"checkpoint_dir={engine.checkpoint_dir}")
-    print(f"best_score={engine.best_score}")
+    for line in _format_final_output(engine):
+        print(line)
     return 0
+
+
+def _format_final_output(engine: SimpleTESEngine) -> list[str]:
+    lines = [
+        f"instance_id={engine.instance_id}",
+        f"checkpoint_dir={engine.checkpoint_dir}",
+        f"best_score={engine.best_score}",
+    ]
+    summary_path = Path(engine.checkpoint_dir) / "syccl_two_agent" / "summary.json"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        lines.extend(
+            [
+                f"syccl_best_time_us={summary.get('best_time_us')}",
+                f"syccl_best_source={summary.get('best_source')}",
+                f"syccl_best_source_round={summary.get('best_source_round')}",
+                f"syccl_summary_json={summary_path}",
+            ]
+        )
+    return lines
 
 
 def _write_task_files(task_dir: Path) -> tuple[Path, Path, Path]:

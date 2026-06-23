@@ -72,11 +72,7 @@ Evaluator metrics:
 - `combined_score`: the only score to maximize; equals `-best_time_us`.
 - `validity`: 1.0 for a valid sketch that simulates successfully, 0.0 otherwise.
 - `best_time_us`: primary performance value to minimize; simulated $Collective time.
-- `critical_link_path`: a source-to-destination chain ending at the last simulated receive; use it as a bottleneck clue, not as the score.
-- `critical_link_queue_wait_ns`: time spent waiting behind other traffic on the critical-link trace; high values suggest contention from the rotated $Collective.
-- `critical_link_latency_ns`: fixed per-hop latency on that trace; high values suggest too many latency-heavy cross-layer hops on the critical path.
-- `critical_link_beta_cost_ns`: bandwidth/data-transfer cost on that trace; 
-- `critical_link_total_ns`: sum of queue wait, latency, and beta cost for the reported critical-link trace. It is diagnostic only; optimize `best_time_us`.
+- `bottleneck_profile`: sketch-level diagnostic information. Use `top_transmission_bottlenecks`, `critical_transmission`, `critical_chain`, and `stage_pressure` to identify which `(step, layer, group, srcs, dsts)` transmissions should change. Do not reason in terms of internal network link ids.
 
 HISTORICAL RECORD:The following is a historical record of the sketches returned in previous trials. Use it to avoid repeating the same patterns and to inspire new ones. The evaluator does not consider these sketches when scoring the current trial, but you can use them as a reference for what has already been tried.
 Trail 0:

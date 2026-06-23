@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import json
 import importlib.util
 import math
 import runpy
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -16,7 +19,6 @@ from simpletes.engine.syccl_two_agent import SycclTwoAgentRuntime
 from syccl_agents.flow_sim import FlowSimRunner
 from syccl_agents.llm import FakeLLMBackend
 from syccl_agents.record_agent import RecordAgent
-from syccl_agents.runner import SycclTwoAgentConfig, SycclTwoAgentRunner
 from syccl_agents.sketch_dsl import parse_sketch_dsl
 from syccl_agents.topodsl import load_topodsl
 
@@ -108,6 +110,67 @@ def _fake_sketch() -> list[dict[str, object]]:
     ]
 
 
+def _fake_bottleneck_profile() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "diagnosis": "transmission 1 step 1 layer 3 group 0 has the largest aggregate delay",
+        "critical_transmission": {
+            "transmission_index": 1,
+            "step": 1,
+            "layer": 3,
+            "group": 0,
+            "srcs": [0],
+            "dsts": [2],
+            "delay_ns": 120,
+            "reason": "transmission 1 is on the critical receive chain",
+        },
+        "critical_chain": [
+            {
+                "transmission_index": 0,
+                "step": 0,
+                "layer": 1,
+                "group": 0,
+                "srcs": [0],
+                "dsts": [1],
+                "dependency": "recv",
+                "finish_ns": 40,
+            },
+            {
+                "transmission_index": 1,
+                "step": 1,
+                "layer": 3,
+                "group": 0,
+                "srcs": [0],
+                "dsts": [2],
+                "dependency": "critical",
+                "finish_ns": 120,
+            },
+        ],
+        "top_transmission_bottlenecks": [
+            {
+                "transmission_index": 1,
+                "step": 1,
+                "layer": 3,
+                "group": 0,
+                "srcs": [0],
+                "dsts": [2],
+                "reason": "transmission 1 has the largest aggregate delay",
+                "delay_ns": 120,
+                "affected_rotated_flows": 4,
+            }
+        ],
+        "stage_pressure": [
+            {
+                "step": 1,
+                "layer": 3,
+                "group": 0,
+                "delay_ns": 120,
+                "affected_rotated_flows": 4,
+            }
+        ],
+    }
+
+
 def _fake_sketch_evolve_block() -> str:
     return """
 ```python
@@ -125,6 +188,121 @@ def construct_sketches():
 # EVOLVE-BLOCK-END
 ```
 """.strip()
+
+
+def _record_completion(round_id: int) -> str:
+    summary = "\n".join(
+        [
+            f"Trail id: {round_id}",
+            f"- transmissions strategy: async record for round {round_id}",
+            "- compact dsl: [(0, 1, 0, 0, [1])]",
+            f"- profile data: time_us={10.0 + round_id}",
+        ]
+    )
+    return json.dumps({"summary": summary, "direction_hint": f"avoid bottleneck from round {round_id}"})
+
+
+class DelayedRecordLLMBackend:
+    def __init__(self, *, record_delay_s: float | dict[int, float] = 0.0, proposal_delay_s: float = 0.0) -> None:
+        self.model_name = "delayed-record-llm"
+        self.prompts: list[str] = []
+        self.calls: list[tuple[str, int, str]] = []
+        self.record_delay_s = record_delay_s
+        self.proposal_delay_s = proposal_delay_s
+        self.record_started_at: dict[int, float] = {}
+        self.record_finished_at: dict[int, float] = {}
+        self.max_concurrent_records = 0
+        self._active_records = 0
+        self._lock = threading.Lock()
+
+    def generate(self, prompt: str, *, agent_type: str, round_id: int):
+        with self._lock:
+            self.prompts.append(prompt)
+            self.calls.append((agent_type, round_id, prompt))
+        if agent_type == "proposal":
+            time.sleep(self.proposal_delay_s)
+            return _fake_llm_response(_fake_sketch_evolve_block(), self.model_name, prompt)
+        if agent_type == "record":
+            delay = (
+                self.record_delay_s.get(round_id, 0.0)
+                if isinstance(self.record_delay_s, dict)
+                else self.record_delay_s
+            )
+            with self._lock:
+                self._active_records += 1
+                self.max_concurrent_records = max(self.max_concurrent_records, self._active_records)
+                self.record_started_at[round_id] = time.perf_counter()
+            time.sleep(delay)
+            with self._lock:
+                self.record_finished_at[round_id] = time.perf_counter()
+                self._active_records -= 1
+            return _fake_llm_response(_record_completion(round_id), self.model_name, prompt)
+        raise AssertionError(f"unexpected agent_type={agent_type!r}")
+
+
+class AsyncDelayedRecordLLMBackend:
+    def __init__(self, *, record_delay_s: float | dict[int, float] = 0.0, proposal_delay_s: float = 0.0) -> None:
+        self.model_name = "async-delayed-record-llm"
+        self.prompts: list[str] = []
+        self.calls: list[tuple[str, int, str]] = []
+        self.record_delay_s = record_delay_s
+        self.proposal_delay_s = proposal_delay_s
+        self.record_started_at: dict[int, float] = {}
+        self.record_finished_at: dict[int, float] = {}
+        self.max_concurrent_records = 0
+        self._active_records = 0
+
+    async def generate(self, prompt: str, *, agent_type: str, round_id: int):
+        self.prompts.append(prompt)
+        self.calls.append((agent_type, round_id, prompt))
+        if agent_type == "proposal":
+            await asyncio.sleep(self.proposal_delay_s)
+            return _fake_llm_response(_fake_sketch_evolve_block(), self.model_name, prompt)
+        if agent_type == "record":
+            delay = (
+                self.record_delay_s.get(round_id, 0.0)
+                if isinstance(self.record_delay_s, dict)
+                else self.record_delay_s
+            )
+            self._active_records += 1
+            self.max_concurrent_records = max(self.max_concurrent_records, self._active_records)
+            self.record_started_at[round_id] = time.perf_counter()
+            await asyncio.sleep(delay)
+            self.record_finished_at[round_id] = time.perf_counter()
+            self._active_records -= 1
+            return _fake_llm_response(_record_completion(round_id), self.model_name, prompt)
+        raise AssertionError(f"unexpected agent_type={agent_type!r}")
+
+
+class AsyncFailingRecordLLMBackend(AsyncDelayedRecordLLMBackend):
+    def __init__(self, *, failing_rounds: set[int]) -> None:
+        super().__init__(record_delay_s=0.0, proposal_delay_s=0.01)
+        self.failing_rounds = set(failing_rounds)
+
+    async def generate(self, prompt: str, *, agent_type: str, round_id: int):
+        if agent_type == "record" and round_id in self.failing_rounds:
+            self.prompts.append(prompt)
+            self.calls.append((agent_type, round_id, prompt))
+            self.record_started_at[round_id] = time.perf_counter()
+            self.record_finished_at[round_id] = time.perf_counter()
+            raise RuntimeError(f"record round {round_id} failed")
+        return await super().generate(prompt, agent_type=agent_type, round_id=round_id)
+
+
+def _fake_llm_response(text: str, model_name: str, prompt: str):
+    from syccl_agents.llm import LLMResponse
+
+    return LLMResponse(
+        text=text,
+        model_name=model_name,
+        input_tokens=len(prompt.split()),
+        output_tokens=len(text.split()),
+        cached_input_tokens=None,
+        reasoning_tokens=None,
+        wall_clock_time_ms=0,
+        api_cost_usd=None,
+        raw_output=text,
+    )
 
 
 def _write_minimal_simpletes_files(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -195,22 +373,59 @@ def _build_engine(
         expanded: list[str] = []
         for idx, completion in enumerate(llm_completions):
             expanded.append(completion)
-            expanded.append(
-                "\n".join(
-                    [
-                        f"Trail id: {idx}",
-                        "- transmissions strategy: record agent summary",
-                        "- compact dsl: " + completion,
-                        "- profile data: time_us=10.0",
-                    ]
-                )
-            )
+            expanded.append(_record_completion(idx))
         llm_completions = expanded
     llm = FakeLLMBackend(llm_completions)
     runtime = SycclTwoAgentRuntime(
         topo_path=topo_path,
         collective=collective,
         message_size=message_size,
+        flow_sim_bin="flow-sim-rs",
+        llm=llm,
+        flow_sim_fn=flow_sim_fn,
+    )
+    return SimpleTESEngine(config, runtime=runtime), llm
+
+
+def _run_engine_without_slow_finalization(engine: SimpleTESEngine) -> None:
+    write_checkpoint = AsyncMock()
+    finalize_run = AsyncMock()
+    with (
+        patch.dict(os.environ, {"MPLCONFIGDIR": str(Path(engine.checkpoint_dir) / "matplotlib")}),
+        patch.object(SimpleTESEngine, "_write_checkpoint", new=write_checkpoint),
+        patch.object(SimpleTESEngine, "_finalize_run", new=finalize_run),
+    ):
+        asyncio.run(engine.run())
+
+
+def _build_engine_with_log_interval(
+    tmp_path: Path,
+    *,
+    topo_path: Path,
+    rounds: int,
+    completions: list[str],
+    flow_sim_fn,
+    log_interval: int,
+) -> tuple[SimpleTESEngine, FakeLLMBackend]:
+    init_program, evaluator, instruction = _write_minimal_simpletes_files(tmp_path)
+    config = EngineConfig(
+        init_program=str(init_program),
+        evaluator_path=str(evaluator),
+        instruction_path=str(instruction),
+        max_generations=rounds,
+        init_eval_repeats=1,
+        output_path=str(tmp_path / "checkpoints"),
+        log_interval=log_interval,
+        db_show_interval=0,
+        num_inspirations=0,
+        num_chains=1,
+        k_candidates=1,
+        gen_concurrency=1,
+        eval_concurrency=1,
+    )
+    llm = FakeLLMBackend(completions)
+    runtime = SycclTwoAgentRuntime(
+        topo_path=topo_path,
         flow_sim_bin="flow-sim-rs",
         llm=llm,
         flow_sim_fn=flow_sim_fn,
@@ -383,7 +598,7 @@ def construct_sketches():
                     "- profile data: real flow-sim integration run",
                 ]
             )
-            llm = FakeLLMBackend([candidate, record_completion])
+            llm = FakeLLMBackend([candidate, json.dumps({"summary": record_completion, "direction_hint": ""})])
             config = EngineConfig(
                 init_program=str(init_program),
                 evaluator_path=str(evaluator),
@@ -392,7 +607,7 @@ def construct_sketches():
                 init_eval_repeats=1,
                 output_path=str(tmp_path / "checkpoints"),
                 save_llm_io=True,
-                log_interval=1,
+                log_interval=0,
                 db_show_interval=0,
                 num_inspirations=0,
                 num_chains=1,
@@ -418,7 +633,7 @@ def construct_sketches():
                 patch.object(SimpleTESEngine, "_finalize_run", new=finalize_run),
             ):
                 asyncio.run(engine.run())
-            self.assertEqual(write_checkpoint.await_count, 2)
+            write_checkpoint.assert_not_awaited()
             finalize_run.assert_awaited_once()
 
             artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
@@ -451,10 +666,25 @@ def construct_sketches():
             enumeration_note="Sketch enumeration: skipped",
             record_summary="round 1: best",
             direction_hint="try a different relay",
+            init_program_reference=(
+                "--- Inspiration 1 ---\n"
+                "Score: -1.000000\n"
+                "Metrics:\n"
+                "  combined_score: -1.000000\n"
+                "Code:\n"
+                "```python\n"
+                "# EVOLVE-BLOCK-START\n"
+                "def construct_sketches():\n"
+                "    return []\n"
+                "# EVOLVE-BLOCK-END\n"
+                "```"
+            ),
         )
         self.assertIn("The target collective is allgather", proposal)
         self.assertIn("rotated across all 4 roots", proposal)
         self.assertIn("def topology():", proposal)
+        self.assertIn("--- Inspiration 1 ---", proposal)
+        self.assertIn("def construct_sketches():", proposal)
         self.assertIn("- message_size_bytes: 4096", proposal)
         self.assertIn("round 1: best", proposal)
         self.assertNotIn("$Collective", proposal)
@@ -468,8 +698,7 @@ def construct_sketches():
                 "combined_score": -10.0,
                 "completion_time": 10.0,
                 "expanded_events": 12,
-                "critical_path": "critical_flow_id=1",
-                "bottleneck_links": ["0->1:120ns"],
+                "bottleneck_profile": _fake_bottleneck_profile(),
                 "best_so_far": True,
                 "proposal_output": "raw proposal",
                 "code_extract_reason": "evolve_block_merged",
@@ -481,9 +710,54 @@ def construct_sketches():
         self.assertIn("Return exactly one record for this attempt.", record)
         self.assertIn("Trail id: 2", record)
         self.assertIn("Proposal LLM output:\nraw proposal", record)
+        self.assertIn("bottleneck_profile", record)
+        self.assertIn("top_transmission_bottlenecks", record)
+        self.assertNotIn("critical path", record.lower())
         self.assertIn('"current_direction_hint": "avoid 0->1"', record)
         print(f"Proposal: {proposal}")
         print(f"Record: {record}")
+
+    def test_record_prompt_rejects_missing_required_metrics(self) -> None:
+        from syccl_agents.prompts import render_record_prompt
+
+        with self.assertRaisesRegex(ValueError, "bottleneck_profile"):
+            render_record_prompt(
+                round_id=1,
+                candidate=_fake_sketch(),
+                metrics={
+                    "validity_status": "ok",
+                    "combined_score": -10.0,
+                    "completion_time": 10.0,
+                    "expanded_events": 12,
+                    "best_so_far": True,
+                },
+                current_summary="",
+                direction_hint="",
+            )
+
+    def test_round_record_validation_rejects_null_required_fields(self) -> None:
+        from syccl_agents.records import validate_round_record
+
+        record = {
+            "topodsl_config_id": "topo",
+            "collective": "allgather",
+            "message_size": 4096,
+            "round_id": 1,
+            "prompt_hash": "a" * 64,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "candidate_sketch": _fake_sketch(),
+            "validity_status": "ok",
+            "expanded_events": 12,
+            "combined_score": -10.0,
+            "completion_time": 10.0,
+            "algorithm_bandwidth": 409.6,
+            "bottleneck_profile": None,
+            "best_so_far": True,
+        }
+
+        with self.assertRaisesRegex(ValueError, "bottleneck_profile"):
+            validate_round_record(record)
 
     def test_cli_task_files_are_loaded_from_syccl_prompt_assets(self) -> None:
         with self._tmpdir() as tmp_path:
@@ -545,7 +819,7 @@ def construct_sketches():
             round_id=1,
             validity_status="ok",
             completion_time=20.0,
-            bottleneck_links=["0->4:120ns"],
+            bottleneck_profile=_fake_bottleneck_profile(),
             candidate_sketch=_fake_sketch(),
             best_so_far=True,
         )
@@ -553,7 +827,7 @@ def construct_sketches():
             round_id=2,
             validity_status="ok",
             completion_time=22.0,
-            bottleneck_links=["0->4:180ns"],
+            bottleneck_profile=_fake_bottleneck_profile(),
             candidate_sketch=_fake_sketch(),
             best_so_far=False,
         )
@@ -561,7 +835,7 @@ def construct_sketches():
             round_id=3,
             validity_status="ok",
             completion_time=21.0,
-            bottleneck_links=["0->4:160ns"],
+            bottleneck_profile=_fake_bottleneck_profile(),
             candidate_sketch=_fake_sketch(),
             best_so_far=False,
         )
@@ -571,9 +845,27 @@ def construct_sketches():
         self.assertEqual(second.direction_hint, first.direction_hint)
         self.assertNotEqual(third.direction_hint, first.direction_hint)
         self.assertIn("stagnated", third.direction_hint.lower())
-        self.assertIn("0->4", third.summary)
+        self.assertIn("tx1 step 1 layer 3 group 0", third.summary)
 
-    def test_experiment_records_have_required_fields(self) -> None:
+    def test_simpletes_runtime_fails_loud_when_simulator_omits_time_us(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=1,
+                completions=[_fake_sketch_evolve_block()],
+                flow_sim_fn=lambda **_: {
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "time_us"):
+                _run_engine_without_slow_finalization(engine)
+
+    def test_simpletes_runtime_fails_loud_when_simulator_omits_bottleneck_profile(self) -> None:
         with self._tmpdir() as tmp_path:
             topo_path = tmp_path / "clos_2host.py"
             _write_python_topodsl(topo_path)
@@ -589,56 +881,8 @@ def construct_sketches():
                 },
             )
 
-            import asyncio
-
-            asyncio.run(engine.run())
-
-            artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
-            round_record = json.loads((artifacts_dir / "rounds.jsonl").read_text().splitlines()[0])
-            llm_records = [json.loads(line) for line in (artifacts_dir / "llm_calls.jsonl").read_text().splitlines()]
-            proposal_record = next(record for record in llm_records if record["agent_type"] == "proposal")
-            record_agent_record = next(record for record in llm_records if record["agent_type"] == "record")
-
-            required_round_fields = {
-                "topodsl_config_id",
-                "collective",
-                "message_size",
-                "round_id",
-                "prompt_hash",
-                "input_tokens",
-                "output_tokens",
-                "combined_score",
-                "candidate_sketch",
-                "validity_status",
-                "expanded_events",
-                "completion_time",
-                "algorithm_bandwidth",
-                "critical_path",
-                "bottleneck_links",
-                "best_so_far",
-            }
-            required_llm_fields = {
-                "run_id",
-                "agent_type",
-                "round_id",
-                "model_name",
-                "input_tokens",
-                "output_tokens",
-                "cached_input_tokens",
-                "reasoning_tokens",
-                "wall_clock_time_ms",
-                "api_cost_usd",
-                "prompt_hash",
-                "completion_hash",
-            }
-            self.assertLessEqual(required_round_fields, set(round_record.keys()))
-            self.assertLessEqual(required_llm_fields, set(proposal_record.keys()))
-            self.assertLessEqual(required_llm_fields, set(record_agent_record.keys()))
-            self.assertEqual(round_record["validity_status"], "ok")
-            self.assertEqual(round_record["combined_score"], -10.0)
-            self.assertEqual(round_record["expanded_events"], 12)
-            self.assertEqual(proposal_record["agent_type"], "proposal")
-            self.assertEqual(record_agent_record["agent_type"], "record")
+            with self.assertRaisesRegex(RuntimeError, "bottleneck_profile.*legacy links"):
+                _run_engine_without_slow_finalization(engine)
 
     def test_proposal_output_uses_simpletes_evolve_block_extraction(self) -> None:
         with self._tmpdir() as tmp_path:
@@ -652,7 +896,7 @@ def construct_sketches():
                 return {
                     "time_us": 10.0,
                     "flow_count": 12,
-                    "links": [],
+                    "bottleneck_profile": _fake_bottleneck_profile(),
                 }
 
             engine, _ = _build_engine(
@@ -663,9 +907,7 @@ def construct_sketches():
                 flow_sim_fn=flow_sim_fn,
             )
 
-            import asyncio
-
-            asyncio.run(engine.run())
+            _run_engine_without_slow_finalization(engine)
 
             artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
             round_record = json.loads((artifacts_dir / "rounds.jsonl").read_text().splitlines()[0])
@@ -693,13 +935,11 @@ def construct_sketches():
                 flow_sim_fn=lambda **_: {
                     "time_us": 10.0,
                     "flow_count": 12,
-                    "links": [],
+                    "bottleneck_profile": _fake_bottleneck_profile(),
                 },
             )
 
-            import asyncio
-
-            asyncio.run(engine.run())
+            _run_engine_without_slow_finalization(engine)
 
             artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
             round_record = json.loads((artifacts_dir / "rounds.jsonl").read_text().splitlines()[0])
@@ -711,18 +951,23 @@ def construct_sketches():
             self.assertIn("Proposal LLM output:", llm.prompts[1])
             self.assertIn(bad_completion, llm.prompts[1])
 
-    def test_record_agent_prompt_requests_one_trail_record_and_applies_text_output(self) -> None:
+    def test_record_agent_prompt_requests_json_record_and_applies_repaired_output(self) -> None:
         with self._tmpdir() as tmp_path:
             topo_path = tmp_path / "clos_2host.py"
             _write_python_topodsl(topo_path)
             completion = _fake_sketch_evolve_block()
-            record_completion = "\n".join(
+            record_summary = "\n".join(
                 [
                     "Trail id: 0",
                     "- transmissions strategy: local fanout, cross layer, remote fanout",
                     "- compact dsl: [(0, 1, 0, 0, [1])]",
                     "- profile data: time_us=10.0, bottleneck=0->4:120ns",
                 ]
+            )
+            record_completion = (
+                "{summary: "
+                + json.dumps(record_summary)
+                + ", direction_hint: \"avoid repaired bottleneck\"}"
             )
             engine, llm = _build_engine(
                 tmp_path,
@@ -732,23 +977,492 @@ def construct_sketches():
                 flow_sim_fn=lambda **_: {
                     "time_us": 10.0,
                     "flow_count": 12,
-                    "links": [{"src": 0, "dst": 4, "queue_wait_ns": 120}],
+                    "bottleneck_profile": _fake_bottleneck_profile(),
                 },
             )
 
-            import asyncio
-
-            asyncio.run(engine.run())
+            _run_engine_without_slow_finalization(engine)
 
             self.assertEqual(len(llm.prompts), 2)
             record_prompt = llm.prompts[1]
             self.assertIn("Return exactly one record for this attempt.", record_prompt)
-            self.assertIn("Trail id: 0", record_prompt)
-            self.assertIn("- transmissions strategy:", record_prompt)
-            self.assertIn("- compact dsl:", record_prompt)
-            self.assertIn("- profile data:", record_prompt)
-            self.assertNotIn("Output only one JSON object", record_prompt)
-            self.assertIn(record_completion, engine.runtime.record_agent.summary)
+            self.assertIn('"summary"', record_prompt)
+            self.assertIn('"direction_hint"', record_prompt)
+            self.assertIn("top_transmission_bottlenecks", record_prompt)
+            self.assertIn("step 1 layer 3 group 0", record_prompt)
+            self.assertNotIn("0->4:120ns", record_prompt)
+            self.assertIn("Output only one JSON object", record_prompt)
+            self.assertIn(record_summary, engine.runtime.record_agent.summary)
+            self.assertEqual(engine.runtime.record_agent.direction_hint, "avoid repaired bottleneck")
+
+    def test_record_agent_retries_unrepairable_json_and_logs_failure(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            bad_record = "[[["
+            good_summary = "Trail id: 0\n- transmissions strategy: retry recovered\n- compact dsl: []\n- profile data: ok"
+            good_record = json.dumps({"summary": good_summary, "direction_hint": "retry recovered"})
+            engine, llm = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=1,
+                completions=[_fake_sketch_evolve_block(), bad_record, good_record],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+
+            _run_engine_without_slow_finalization(engine)
+
+            artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
+            summary = json.loads((artifacts_dir / "summary.json").read_text())
+            errors = [json.loads(line) for line in (artifacts_dir / "record_errors.jsonl").read_text().splitlines()]
+            self.assertEqual(summary["record_tasks_failed"], 0)
+            self.assertEqual(summary["record_tasks_retried"], 1)
+            self.assertEqual(errors[0]["round_id"], 1)
+            self.assertEqual(errors[0]["attempt"], 1)
+            self.assertIn("RecordAgentOutputError", errors[0]["error_type"])
+            self.assertIn("retry recovered", engine.runtime.record_agent.summary)
+            llm_records = [json.loads(line) for line in (artifacts_dir / "llm_calls.jsonl").read_text().splitlines()]
+            self.assertEqual(len(llm.prompts), 3)
+            self.assertEqual([record["agent_type"] for record in llm_records], ["proposal", "record", "record"])
+            self.assertIn("Record agent output failed", (Path(engine.checkpoint_dir) / "run.log").read_text())
+
+    def test_record_agent_preserves_failed_retry_attempt_artifacts(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=1,
+                completions=[_fake_sketch_evolve_block(), "not json", "{summary:"],
+                save_llm_io=True,
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+
+            _run_engine_without_slow_finalization(engine)
+
+            artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
+            summary = json.loads((artifacts_dir / "summary.json").read_text())
+            errors = [json.loads(line) for line in (artifacts_dir / "record_errors.jsonl").read_text().splitlines()]
+            llm_records = [json.loads(line) for line in (artifacts_dir / "llm_calls.jsonl").read_text().splitlines()]
+            record_llm_records = [record for record in llm_records if record["agent_type"] == "record"]
+
+            self.assertEqual(summary["record_tasks_failed"], 1)
+            self.assertEqual(summary["record_tasks_retried"], 1)
+            self.assertEqual([record["will_retry"] for record in errors], [True, False])
+            self.assertEqual([record["attempt"] for record in errors], [1, 2])
+            self.assertEqual([record["attempt"] for record in record_llm_records], [1, 2])
+            self.assertEqual(len(llm_records), 3)
+            self.assertNotEqual(record_llm_records[0]["completion_path"], record_llm_records[1]["completion_path"])
+            self.assertEqual((artifacts_dir / record_llm_records[0]["completion_path"]).read_text(), "not json")
+            self.assertEqual((artifacts_dir / record_llm_records[1]["completion_path"]).read_text(), "{summary:")
+            run_log = (Path(engine.checkpoint_dir) / "run.log").read_text()
+            self.assertIn("Record agent output failed for round 1 attempt 1; retrying", run_log)
+            self.assertIn("Record agent output failed for round 1 attempt 2; giving up", run_log)
+
+    def test_proposal_prompt_includes_initial_program_reference(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            engine, llm = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=1,
+                completions=[_fake_sketch_evolve_block()],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+
+            _run_engine_without_slow_finalization(engine)
+
+            proposal_prompt = llm.prompts[0]
+            self.assertIn("--- Inspiration 1 ---", proposal_prompt)
+            self.assertIn("Initial program reference", proposal_prompt)
+            self.assertIn("def run_code():", proposal_prompt)
+            self.assertIn("def construct_sketches():", proposal_prompt)
+            self.assertIn("# EVOLVE-BLOCK-START", proposal_prompt)
+            self.assertIn("# EVOLVE-BLOCK-END", proposal_prompt)
+
+    def test_initial_program_is_evaluated_with_flow_sim_baseline(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            calls: list[Path] = []
+
+            def flow_sim_fn(*, sketch_path: Path, **_: object) -> dict[str, object]:
+                calls.append(sketch_path)
+                return {
+                    "time_us": 7.0 if len(calls) == 1 else 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                }
+
+            engine, llm = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=1,
+                completions=[_fake_sketch_evolve_block()],
+                flow_sim_fn=flow_sim_fn,
+            )
+
+            _run_engine_without_slow_finalization(engine)
+
+            artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
+            summary = json.loads((artifacts_dir / "summary.json").read_text())
+            root = next(node for node in engine.db.nodes.values() if not node.parent_ids)
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(root.metrics["validity_status"], "ok")
+            self.assertEqual(root.metrics["completion_time"], 7.0)
+            self.assertEqual(root.score, -7.0)
+            self.assertEqual(engine.best_score, -7.0)
+            self.assertEqual(summary["initial_time_us"], 7.0)
+            self.assertEqual(summary["best_time_us"], 7.0)
+            self.assertEqual(summary["best_source"], "initial")
+            self.assertEqual(summary["best_source_round"], 0)
+            self.assertIn("Score: -7.0", llm.prompts[0])
+            self.assertNotIn("-1000000000000", llm.prompts[0])
+
+    def test_runtime_initial_program_uses_topodsl_gpu_count(self) -> None:
+        from syccl_agents.prompts import load_init_program
+
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_64gpu.py"
+            topo_path.write_text(
+                """
+def topology():
+    return {
+        "family": "clos",
+        "hosts": 8,
+        "gpus_per_host": 8,
+        "nics_per_host": 1,
+        "leaf_switches": 2,
+        "spine_switches": 1,
+        "message_size": 1048576,
+        "collective": "allgather",
+    }
+""".lstrip(),
+                encoding="utf-8",
+            )
+            init_program, evaluator, instruction = _write_minimal_simpletes_files(tmp_path)
+            init_program.write_text(load_init_program(), encoding="utf-8")
+            config = EngineConfig(
+                init_program=str(init_program),
+                evaluator_path=str(evaluator),
+                instruction_path=str(instruction),
+                max_generations=1,
+                init_eval_repeats=1,
+                output_path=str(tmp_path / "checkpoints"),
+                log_interval=1,
+                db_show_interval=0,
+                num_inspirations=0,
+                num_chains=1,
+                k_candidates=1,
+                gen_concurrency=1,
+                eval_concurrency=1,
+            )
+
+            def flow_sim_fn(*, sketch_path: Path, **_: object) -> dict[str, object]:
+                sketch = json.loads(sketch_path.read_text())
+                seen_gpus = [gpu for tx in sketch for gpu in tx["srcs"] + tx["dsts"]]
+                if max(seen_gpus, default=0) >= 64:
+                    raise AssertionError("initial sketch used a GPU id outside the 64-GPU topology")
+                return {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                }
+
+            llm = FakeLLMBackend([_fake_sketch_evolve_block(), _record_completion(0)])
+            runtime = SycclTwoAgentRuntime(
+                topo_path=topo_path,
+                flow_sim_bin="flow-sim-rs",
+                llm=llm,
+                flow_sim_fn=flow_sim_fn,
+            )
+            engine = SimpleTESEngine(config, runtime=runtime)
+
+            _run_engine_without_slow_finalization(engine)
+
+            artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
+            initial_sketch = json.loads((artifacts_dir / "initial-sketch.json").read_text())
+            self.assertEqual(len(initial_sketch), 63)
+            self.assertLess(max(gpu for tx in initial_sketch for gpu in tx["srcs"] + tx["dsts"]), 64)
+
+    def test_runtime_leaves_final_checkpoint_to_finalize_run(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            engine, _ = _build_engine_with_log_interval(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=1,
+                completions=[_fake_sketch_evolve_block(), _record_completion(0)],
+                log_interval=0,
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+            write_checkpoint = AsyncMock()
+            finalize_run = AsyncMock()
+
+            with (
+                patch.object(SimpleTESEngine, "_write_checkpoint", new=write_checkpoint),
+                patch.object(SimpleTESEngine, "_finalize_run", new=finalize_run),
+            ):
+                asyncio.run(engine.run())
+
+            write_checkpoint.assert_not_awaited()
+            finalize_run.assert_awaited_once()
+
+    def test_generated_nodes_store_full_python_and_root_parent(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=1,
+                completions=[_fake_sketch_evolve_block()],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+
+            _run_engine_without_slow_finalization(engine)
+
+            nodes = [node.to_dict(include_llm_io=False) for node in engine.db.nodes.values()]
+            root = next(node for node in nodes if not node.get("parent_ids"))
+            generated = [node for node in nodes if node.get("parent_ids")]
+            self.assertEqual(len(generated), 1)
+            self.assertEqual(generated[0]["parent_ids"], [root["id"]])
+            self.assertIn("def run_code():", generated[0]["code"])
+            self.assertIn("# EVOLVE-BLOCK-START", generated[0]["code"])
+            self.assertNotEqual(generated[0]["code"].lstrip()[0], "[")
+
+    def test_all_generated_nodes_use_root_parent(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=2,
+                completions=[_fake_sketch_evolve_block(), _fake_sketch_evolve_block()],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+
+            _run_engine_without_slow_finalization(engine)
+
+            nodes = [node.to_dict(include_llm_io=False) for node in engine.db.nodes.values()]
+            root = next(node for node in nodes if not node.get("parent_ids"))
+            generated = [node for node in nodes if node.get("parent_ids")]
+            self.assertEqual(len(generated), 2)
+            self.assertEqual([node["parent_ids"] for node in generated], [[root["id"]], [root["id"]]])
+
+    def test_proposal_context_uses_only_applied_llm_record_summary(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            llm = AsyncDelayedRecordLLMBackend(record_delay_s={1: 0.05, 2: 0.0})
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=2,
+                completions=[],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+            engine.runtime.llm = llm
+
+            _run_engine_without_slow_finalization(engine)
+
+            proposal2_prompt = next(prompt for agent_type, round_id, prompt in llm.calls if (agent_type, round_id) == ("proposal", 2))
+            self.assertNotIn("round 1: best", proposal2_prompt)
+            self.assertNotIn("sketch_bottlenecks=", proposal2_prompt)
+            self.assertNotIn("Trail id: 1", proposal2_prompt)
+
+    def test_async_record_does_not_block_next_proposal(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            llm = AsyncDelayedRecordLLMBackend(record_delay_s={1: 0.05, 2: 0.0})
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=2,
+                completions=[],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+            engine.runtime.llm = llm
+
+            _run_engine_without_slow_finalization(engine)
+
+            proposal2 = next(index for index, call in enumerate(llm.calls) if call[:2] == ("proposal", 2))
+            record1 = next(index for index, call in enumerate(llm.calls) if call[:2] == ("record", 1))
+            self.assertLess(record1, proposal2)
+            self.assertLess(llm.record_started_at[1], llm.record_started_at[2])
+            self.assertNotIn(1, llm.record_finished_at)
+
+    def test_async_record_backlog_waits_when_five_tasks_are_pending(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            llm = AsyncDelayedRecordLLMBackend(record_delay_s={idx: 0.05 for idx in range(1, 7)})
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=6,
+                completions=[],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+            engine.runtime.llm = llm
+
+            _run_engine_without_slow_finalization(engine)
+
+            self.assertLessEqual(llm.max_concurrent_records, 5)
+            self.assertGreaterEqual(llm.record_started_at[6], min(llm.record_finished_at.values()))
+
+    def test_async_record_backlog_wait_is_reported_in_summary(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            llm = AsyncDelayedRecordLLMBackend(record_delay_s={idx: 0.05 for idx in range(1, 7)})
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=6,
+                completions=[],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+            engine.runtime.llm = llm
+
+            _run_engine_without_slow_finalization(engine)
+
+            artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
+            summary = json.loads((artifacts_dir / "summary.json").read_text())
+            self.assertGreater(summary["proposal_wait_for_record_backlog_events"], 0)
+            self.assertGreater(summary["proposal_wait_for_record_backlog_ms_total"], 0)
+            self.assertGreater(summary["proposal_wait_for_record_backlog_ms_max"], 0)
+
+    def test_async_record_backlog_counts_out_of_order_completed_records(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            llm = AsyncDelayedRecordLLMBackend(
+                record_delay_s={1: 0.08, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0},
+                proposal_delay_s=0.005,
+            )
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=6,
+                completions=[],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+            engine.runtime.llm = llm
+
+            _run_engine_without_slow_finalization(engine)
+
+            self.assertGreater(llm.record_started_at[6], llm.record_finished_at[1])
+
+    def test_async_record_applies_completed_results_in_strict_round_order(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            llm = AsyncDelayedRecordLLMBackend(
+                record_delay_s={1: 0.035, 2: 0.0, 3: 0.0},
+                proposal_delay_s=0.02,
+            )
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=4,
+                completions=[],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+            engine.runtime.llm = llm
+
+            _run_engine_without_slow_finalization(engine)
+
+            proposal3_prompt = next(prompt for agent_type, round_id, prompt in llm.calls if (agent_type, round_id) == ("proposal", 3))
+            proposal4_prompt = next(prompt for agent_type, round_id, prompt in llm.calls if (agent_type, round_id) == ("proposal", 4))
+            self.assertNotIn("Trail id: 2", proposal3_prompt)
+            self.assertIn("Trail id: 1", proposal4_prompt)
+            self.assertIn("Trail id: 2", proposal4_prompt)
+
+    def test_async_record_failure_does_not_block_later_records(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            llm = AsyncFailingRecordLLMBackend(failing_rounds={1})
+            engine, _ = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=3,
+                completions=[],
+                flow_sim_fn=lambda **_: {
+                    "time_us": 10.0,
+                    "flow_count": 12,
+                    "bottleneck_profile": _fake_bottleneck_profile(),
+                },
+            )
+            engine.runtime.llm = llm
+
+            _run_engine_without_slow_finalization(engine)
+
+            proposal3_prompt = next(prompt for agent_type, round_id, prompt in llm.calls if (agent_type, round_id) == ("proposal", 3))
+            self.assertNotIn("Trail id: 1", proposal3_prompt)
+            self.assertIn("Trail id: 2", proposal3_prompt)
+            artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
+            summary = json.loads((artifacts_dir / "summary.json").read_text())
+            self.assertEqual(summary["record_tasks_failed"], 1)
+            errors = [json.loads(line) for line in (artifacts_dir / "record_errors.jsonl").read_text().splitlines()]
+            self.assertEqual(errors[0]["round_id"], 1)
+            self.assertEqual(errors[0]["error_type"], "RuntimeError")
+            self.assertIn("record round 1 failed", errors[0]["message"])
 
     def test_llm_prompt_and_completion_are_saved_for_inspection(self) -> None:
         with self._tmpdir() as tmp_path:
@@ -764,13 +1478,11 @@ def construct_sketches():
                 flow_sim_fn=lambda **_: {
                     "time_us": 10.0,
                     "flow_count": 12,
-                    "links": [],
+                    "bottleneck_profile": _fake_bottleneck_profile(),
                 },
             )
 
-            import asyncio
-
-            asyncio.run(engine.run())
+            _run_engine_without_slow_finalization(engine)
 
             artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
             llm_record = json.loads((artifacts_dir / "llm_calls.jsonl").read_text().splitlines()[0])
@@ -801,6 +1513,49 @@ def construct_sketches():
         self.assertIsNone(args.message_size)
         self.assertIsNone(args.collective)
 
+    def test_cli_env_toml_missing_path_fails_loud(self) -> None:
+        runner_script = _load_runner_script()
+
+        with self.assertRaisesRegex(FileNotFoundError, "env.toml"):
+            runner_script.load_env_toml("/tmp/definitely-missing-syccl-env.toml")
+
+    def test_cli_prints_syccl_summary_fields_when_summary_exists(self) -> None:
+        runner_script = _load_runner_script()
+
+        with self._tmpdir() as tmp_path:
+            checkpoint_dir = tmp_path / "checkpoints" / "2026-06-22" / "instance-test"
+            summary_dir = checkpoint_dir / "syccl_two_agent"
+            summary_dir.mkdir(parents=True)
+            (summary_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "best_time_us": 12.5,
+                        "best_source": "initial",
+                        "best_source_round": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            engine = type(
+                "Engine",
+                (),
+                {
+                    "instance_id": "test",
+                    "checkpoint_dir": str(checkpoint_dir),
+                    "best_score": -12.5,
+                },
+            )()
+
+            lines = runner_script._format_final_output(engine)
+
+            self.assertIn("instance_id=test", lines)
+            self.assertIn(f"checkpoint_dir={checkpoint_dir}", lines)
+            self.assertIn("best_score=-12.5", lines)
+            self.assertIn("syccl_best_time_us=12.5", lines)
+            self.assertIn("syccl_best_source=initial", lines)
+            self.assertIn("syccl_best_source_round=0", lines)
+            self.assertIn(f"syccl_summary_json={summary_dir / 'summary.json'}", lines)
+
     def test_runtime_uses_collective_and_message_size_from_topodsl_by_default(self) -> None:
         with self._tmpdir() as tmp_path:
             topo_path = tmp_path / "clos_derived.py"
@@ -815,13 +1570,11 @@ def construct_sketches():
                 flow_sim_fn=lambda **_: {
                     "time_us": 10.0,
                     "flow_count": 12,
-                    "links": [],
+                    "bottleneck_profile": _fake_bottleneck_profile(),
                 },
             )
 
-            import asyncio
-
-            asyncio.run(engine.run())
+            _run_engine_without_slow_finalization(engine)
 
             artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
             round_record = json.loads((artifacts_dir / "rounds.jsonl").read_text().splitlines()[0])
@@ -844,15 +1597,13 @@ def construct_sketches():
                 flow_sim_fn=lambda **_: {
                     "time_us": 10.0,
                     "flow_count": 12,
-                    "links": [],
+                    "bottleneck_profile": _fake_bottleneck_profile(),
                 },
             )
 
-            import asyncio
+            _run_engine_without_slow_finalization(engine)
 
-            asyncio.run(engine.run())
-
-            nodes = _read_latest_checkpoint_nodes(engine)
+            nodes = [node.to_dict(include_llm_io=True) for node in engine.db.nodes.values()]
             generated = [node for node in nodes if node.get("parent_ids")]
             self.assertEqual(len(generated), 1)
             self.assertIn("topo_dsl:\n```python", generated[0]["llm_input"])
@@ -877,7 +1628,7 @@ def construct_sketches():
                 return {
                     "time_us": 10.0 + len(calls),
                     "flow_count": 12,
-                    "links": [{"src": 0, "dst": 4, "queue_wait_ns": 120 + len(calls)}],
+                    "bottleneck_profile": _fake_bottleneck_profile(),
                 }
 
             engine, _ = _build_engine(
@@ -888,14 +1639,12 @@ def construct_sketches():
                 flow_sim_fn=flow_sim_fn,
             )
 
-            import asyncio
+            _run_engine_without_slow_finalization(engine)
 
-            asyncio.run(engine.run())
-
-            self.assertEqual(len(calls), 10)
+            self.assertEqual(len(calls), 11)
             artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
             summary = json.loads((artifacts_dir / "summary.json").read_text())
-            nodes = _read_latest_checkpoint_nodes(engine)
+            nodes = [node.to_dict(include_llm_io=False) for node in engine.db.nodes.values()]
             generated = [node for node in nodes if node.get("parent_ids")]
             self.assertEqual(len(generated), 10)
             self.assertEqual(summary["rounds_completed"], 10)
@@ -916,13 +1665,11 @@ def construct_sketches():
                 flow_sim_fn=lambda **_: {
                     "time_us": 10.0,
                     "flow_count": 12,
-                    "links": [],
+                    "bottleneck_profile": _fake_bottleneck_profile(),
                 },
             )
 
-            import asyncio
-
-            asyncio.run(engine.run())
+            _run_engine_without_slow_finalization(engine)
 
             self.assertIn("Sketch enumeration: skipped", llm.prompts[0])
             self.assertIn("not compact DSL", llm.prompts[0])
@@ -939,13 +1686,11 @@ def construct_sketches():
                 flow_sim_fn=lambda **_: {
                     "time_us": 10.0,
                     "flow_count": 12,
-                    "links": [],
+                    "bottleneck_profile": _fake_bottleneck_profile(),
                 },
             )
 
-            import asyncio
-
-            asyncio.run(engine.run())
+            _run_engine_without_slow_finalization(engine)
 
             prompt = llm.prompts[0]
             self.assertIn("Optimize SyCCL direct-event sketch generation", prompt)
@@ -1013,7 +1758,10 @@ def construct_sketches():
                 seen["command"] = command
                 seen["kwargs"] = kwargs
                 output = Path(command[command.index("--output") + 1])
-                output.write_text(json.dumps({"time_us": 1.0, "flow_count": 1, "links": []}), encoding="utf-8")
+                output.write_text(
+                    json.dumps({"time_us": 1.0, "flow_count": 1, "bottleneck_profile": _fake_bottleneck_profile()}),
+                    encoding="utf-8",
+                )
 
                 class Completed:
                     returncode = 0
@@ -1035,42 +1783,28 @@ def construct_sketches():
             self.assertEqual(command[:2], ["flow-sim-rs", "simulate-sketch"])
             self.assertNotIn("scheme1_direct_events/evaluator.py", " ".join(command))
 
-    def test_standalone_runner_uses_evolve_block_extraction(self) -> None:
+    def test_flow_sim_runner_rejects_output_without_bottleneck_profile(self) -> None:
         with self._tmpdir() as tmp_path:
-            topo_path = tmp_path / "clos_2host.py"
-            _write_python_topodsl(topo_path)
-            llm = FakeLLMBackend([_fake_sketch_evolve_block()])
-            runner = SycclTwoAgentRunner(
-                SycclTwoAgentConfig(
-                    topo_path=topo_path,
-                    output_dir=tmp_path / "runner_out",
-                    rounds=1,
-                    save_llm_io=True,
-                ),
-                llm=llm,
-            )
-            seen: dict[str, object] = {}
+            def fake_run(command: list[str], **kwargs: object) -> object:
+                del kwargs
+                output = Path(command[command.index("--output") + 1])
+                output.write_text(json.dumps({"time_us": 1.0, "flow_count": 1, "links": []}), encoding="utf-8")
 
-            def flow_sim_fn(*, sketch_path: Path, **_: object) -> dict[str, object]:
-                seen["sketch"] = json.loads(sketch_path.read_text())
-                return {
-                    "time_us": 10.0,
-                    "flow_count": 12,
-                    "links": [],
-                }
+                class Completed:
+                    returncode = 0
+                    stdout = "ok"
+                    stderr = ""
 
-            runner.run(flow_sim_fn=flow_sim_fn)
+                return Completed()
 
-            out = tmp_path / "runner_out"
-            round_record = json.loads((out / "rounds.jsonl").read_text().splitlines()[0])
-            candidate_code = out / "rounds" / "round-0001-candidate.py"
-            self.assertTrue(candidate_code.exists())
-            self.assertIn("# EVOLVE-BLOCK-START", candidate_code.read_text())
-            self.assertEqual(round_record["code_extract_reason"], "evolve_block_merged")
-            self.assertEqual(round_record["candidate_code_path"], "rounds/round-0001-candidate.py")
-            self.assertEqual(round_record["proposal_output"], _fake_sketch_evolve_block())
-            self.assertEqual(round_record["combined_score"], -10.0)
-            self.assertEqual(seen["sketch"], _fake_sketch())
+            with patch("subprocess.run", fake_run):
+                runner = FlowSimRunner("flow-sim-rs")
+                with self.assertRaisesRegex(RuntimeError, "bottleneck_profile"):
+                    runner.simulate_sketch(
+                        config_path=tmp_path / "config.json",
+                        sketch_path=tmp_path / "sketch.json",
+                        output_path=tmp_path / "sim.json",
+                    )
 
     def _tmpdir(self):
         import tempfile

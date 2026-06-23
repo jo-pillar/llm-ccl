@@ -6,11 +6,14 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from warnings import deprecated
 
 from simpletes.node import EvolveBlockContext, extract_code_detailed
 from simpletes.engine.syccl_two_agent import (
+    CandidateInvalidError,
     FAILURE_COMPLETION_TIME,
     FAILURE_SCORE,
+    MissingBottleneckProfileError,
     _artifact_relpath,
     _run_candidate_code,
 )
@@ -20,7 +23,7 @@ from syccl_agents.config_render import (
     topology_summary,
     write_syccl_config,
 )
-from syccl_agents.flow_sim import FlowSimRunner
+from syccl_agents.flow_sim import FlowSimOutputError, FlowSimRunner, validate_flow_sim_result
 from syccl_agents.llm import LLMResponse
 from syccl_agents.record_agent import RecordAgent
 from syccl_agents.records import (
@@ -70,8 +73,8 @@ class SycclTwoAgentRunner:
         self.llm = llm
         self.record_agent = record_agent or RecordAgent()
         self.run_id = f"syccl-two-agent-{uuid.uuid4().hex[:12]}"
-
-    def run(self, *, flow_sim_fn: FlowSimFn | None = None) -> SycclTwoAgentResult:
+    @deprecated(reason="This method is not intended to be used directly; ")
+    def __run(self, *, flow_sim_fn: FlowSimFn | None = None) -> SycclTwoAgentResult:
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         topo = load_topodsl(
@@ -112,11 +115,14 @@ class SycclTwoAgentRunner:
             try:
                 candidate_code, code_extract_reason = extract_code_detailed(llm_response.text, evolve_context)
                 if candidate_code is None:
-                    raise ValueError(code_extract_reason)
+                    raise CandidateInvalidError(code_extract_reason)
                 candidate_code_path = output_dir / "rounds" / f"round-{round_id:04d}-candidate.py"
                 candidate_code_path.parent.mkdir(parents=True, exist_ok=True)
                 candidate_code_path.write_text(candidate_code, encoding="utf-8")
-                candidate = _run_candidate_code(candidate_code_path)
+                try:
+                    candidate = _run_candidate_code(candidate_code_path)
+                except Exception as exc:
+                    raise CandidateInvalidError(str(exc)) from exc
                 sketch_path = write_compact_sketch(candidate, output_dir / "rounds" / f"round-{round_id:04d}-sketch.json")
                 sim_output_path = output_dir / "rounds" / f"round-{round_id:04d}-flow-sim.json"
                 sim_result = (
@@ -128,18 +134,19 @@ class SycclTwoAgentRunner:
                         output_path=sim_output_path,
                     )
                 )
+                sim_result = validate_flow_sim_result(sim_result, output_path=sim_output_path)
                 validity_status = "ok"
-                completion_time = float(sim_result.get("time_us"))
-                expanded_events = int(sim_result.get("flow_count", 0))
-                bottleneck_links = _bottleneck_links(sim_result)
-                critical_path = _critical_path(sim_result)
-            except Exception as exc:
+                completion_time = float(sim_result["time_us"])
+                expanded_events = int(sim_result["flow_count"])
+                bottleneck_profile = _bottleneck_profile(sim_result, candidate)
+            except (MissingBottleneckProfileError, FlowSimOutputError, OSError):
+                raise
+            except CandidateInvalidError as exc:
                 candidate = []
                 validity_status = f"invalid: {exc}"
                 completion_time = FAILURE_COMPLETION_TIME
                 expanded_events = 0
-                bottleneck_links = []
-                critical_path = str(exc)
+                bottleneck_profile = _invalid_bottleneck_profile(str(exc))
 
             best_so_far = math.isfinite(completion_time) and (best_time is None or completion_time < best_time)
             if best_so_far:
@@ -151,7 +158,7 @@ class SycclTwoAgentRunner:
                 round_id=round_id,
                 validity_status=validity_status,
                 completion_time=completion_time,
-                bottleneck_links=bottleneck_links,
+                bottleneck_profile=bottleneck_profile,
                 candidate_sketch=candidate,
                 best_so_far=best_so_far,
             )
@@ -167,8 +174,7 @@ class SycclTwoAgentRunner:
                 expanded_events=expanded_events,
                 combined_score=_score(completion_time),
                 completion_time=completion_time,
-                bottleneck_links=bottleneck_links,
-                critical_path=critical_path,
+                bottleneck_profile=bottleneck_profile,
                 best_so_far=best_so_far,
                 proposal_output=llm_response.raw_output or llm_response.text,
                 code_extract_reason=code_extract_reason,
@@ -268,8 +274,7 @@ class SycclTwoAgentRunner:
         expanded_events: int,
         combined_score: float,
         completion_time: float | None,
-        bottleneck_links: list[str],
-        critical_path: str,
+        bottleneck_profile: dict[str, Any],
         best_so_far: bool,
         proposal_output: str,
         code_extract_reason: str | None,
@@ -289,8 +294,7 @@ class SycclTwoAgentRunner:
             "combined_score": combined_score,
             "completion_time": completion_time,
             "algorithm_bandwidth": _algorithm_bandwidth(message_size, completion_time),
-            "critical_path": critical_path,
-            "bottleneck_links": bottleneck_links,
+            "bottleneck_profile": bottleneck_profile,
             "best_so_far": best_so_far,
             "proposal_output": proposal_output,
             "code_extract_reason": code_extract_reason,
@@ -300,21 +304,28 @@ class SycclTwoAgentRunner:
         append_jsonl(self.config.output_dir / "rounds.jsonl", record)
 
 
-def _bottleneck_links(result: dict[str, Any]) -> list[str]:
-    links = result.get("links") or []
-    normalized = []
-    for link in links:
-        wait = int(link.get("queue_wait_ns", 0))
-        normalized.append((wait, f"{link.get('src')}->{link.get('dst')}:{wait}ns"))
-    normalized.sort(reverse=True)
-    return [text for _, text in normalized[:5]]
+def _bottleneck_profile(result: dict[str, Any], candidate: list[dict[str, Any]]) -> dict[str, Any]:
+    profile = result.get("bottleneck_profile")
+    if isinstance(profile, dict):
+        return profile
+    links = result.get("links")
+    link_note = " legacy links were present but cannot be mapped to sketch transmissions." if links else ""
+    raise MissingBottleneckProfileError(
+        "flow-sim result is missing required bottleneck_profile; update flow-sim-rs to emit "
+        "sketch-level bottleneck_profile diagnostics or disable this optimizer path."
+        f"{link_note}"
+    )
 
 
-def _critical_path(result: dict[str, Any]) -> str:
-    critical = result.get("critical_flow_id")
-    if critical is not None:
-        return f"critical_flow_id={critical}"
-    return f"finish_time_ns={result.get('finish_time_ns', 'unknown')}"
+def _invalid_bottleneck_profile(error: str) -> dict[str, Any]:
+    return {
+        "status": "invalid",
+        "diagnosis": error,
+        "critical_transmission": None,
+        "critical_chain": [],
+        "top_transmission_bottlenecks": [],
+        "stage_pressure": [],
+    }
 
 
 def _algorithm_bandwidth(message_size: int | None, completion_time_us: float | None) -> float | None:
