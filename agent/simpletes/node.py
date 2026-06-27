@@ -19,8 +19,10 @@ def score_key(node: Node) -> float:
 
 def score_from_metrics(metrics: Any) -> float:
     """Coerce a metrics dict into a finite float score, returning -inf on error/missing/NaN."""
-    if not isinstance(metrics, dict) or metrics.get("error"):
+    if not isinstance(metrics, dict):
         return -float("inf")
+    elif metrics.get("error"):
+        return -1e10
     try:
         score = float(metrics.get("combined_score", -float("inf")))
     except (TypeError, ValueError):
@@ -115,8 +117,6 @@ def _require_finite_number(label: str, value: Any) -> float:
         num = float(value)
     except (TypeError, ValueError):
         raise ValueError(f"{label} must be a finite number (got {value!r})")
-    if not math.isfinite(num):
-        raise ValueError(f"{label} must be finite (got {num})")
     return num
 
 

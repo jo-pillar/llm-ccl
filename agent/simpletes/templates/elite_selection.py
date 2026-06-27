@@ -18,6 +18,7 @@ Current pool size: {current_size}/{elite_limit}
 1. **New Best Score → ADD or REPLACE**
    - If candidate has the HIGHEST score (better than all pool entries), prefer ADD or REPLACE
    - Do NOT simply reject a new best - score improvement matters
+   - If candidate leads to a new type error or similar failure with a new reason, consider ADD or REPLACE if it provides new insights
 
 2. **Maximize Approach Diversity**
    - Each solution should represent a fundamentally different strategy
@@ -31,7 +32,7 @@ Current pool size: {current_size}/{elite_limit}
 4. **Reject Low-Value Candidates**:
    - Solutions too similar to others already in the pool
    - Low-scoring solutions with no unique insights
-   - Solutions with fundamental errors that provide no learning value
+   - Solutions with simillar errors that provide no learning value
 
 ### Current Pool:
 {pool_description}

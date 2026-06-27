@@ -68,7 +68,7 @@ def write_config(path: Path, *, coll_name: str, hosts: int, topology: str):
 
 
 class SycclDynamicConfigTest(unittest.TestCase):
-  def test_evaluator_derives_multirail_512gpu_groups_from_config(self):
+  def test_evaluator_reads_multirail_512gpu_task_size_from_config(self):
     with tempfile.TemporaryDirectory(prefix="syccl_dynamic_") as tmp:
       config_path = Path(tmp) / "multirail-512gpu-a2a-4k.json"
       write_config(config_path, coll_name="alltoall", hosts=64, topology="multirail")
@@ -78,18 +78,11 @@ class SycclDynamicConfigTest(unittest.TestCase):
       self.assertEqual(512, evaluator.NGPUS)
       self.assertEqual(64, evaluator.TASK_HOST_NUM)
       self.assertEqual(8, evaluator.TASK_HOST_GPU_NUM)
-      self.assertEqual(set(range(8)), evaluator.LAYER_GROUPS[1][0])
-      self.assertEqual(64, len(evaluator.LAYER_GROUPS[3][0]))
-      self.assertTrue({0, 8, 16, 504}.issubset(evaluator.LAYER_GROUPS[3][0]))
+      self.assertEqual(4096, evaluator.COLL_BYTE)
+      self.assertFalse(hasattr(evaluator, "LAYER_GROUPS"))
+      self.assertFalse(hasattr(evaluator, "render_instruction_for_config"))
 
-      instruction = evaluator.render_instruction_for_config(config_path)
-      self.assertIn("512 GPUs", instruction)
-      self.assertIn("alltoall", instruction)
-      self.assertIn("multirail", instruction)
-      self.assertIn("coll.byte=4096", instruction)
-
-
-  def test_evaluator_derives_clos_128gpu_groups_from_config(self):
+  def test_evaluator_reads_clos_128gpu_task_size_from_config(self):
     with tempfile.TemporaryDirectory(prefix="syccl_dynamic_") as tmp:
       config_path = Path(tmp) / "clos-128gpu-ag-4k.json"
       write_config(config_path, coll_name="allgather", hosts=16, topology="clos")
@@ -97,14 +90,11 @@ class SycclDynamicConfigTest(unittest.TestCase):
       evaluator = load_evaluator_with_config(config_path)
 
       self.assertEqual(128, evaluator.NGPUS)
-      self.assertEqual(set(range(0, 64)), evaluator.LAYER_GROUPS[3][0])
-      self.assertEqual(set(range(64, 128)), evaluator.LAYER_GROUPS[3][1])
-      self.assertEqual(set(range(128)), evaluator.LAYER_GROUPS[4][0])
-
-      instruction = evaluator.render_instruction_for_config(config_path)
-      self.assertIn("128 GPUs", instruction)
-      self.assertIn("allgather", instruction)
-      self.assertIn("Clos", instruction)
+      self.assertEqual(16, evaluator.TASK_HOST_NUM)
+      self.assertEqual(8, evaluator.TASK_HOST_GPU_NUM)
+      self.assertEqual(4096, evaluator.COLL_BYTE)
+      self.assertFalse(hasattr(evaluator, "LAYER_GROUPS"))
+      self.assertFalse(hasattr(evaluator, "render_instruction_for_config"))
 
 
 if __name__ == "__main__":

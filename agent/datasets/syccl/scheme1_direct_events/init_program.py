@@ -1,48 +1,63 @@
 # EVOLVE-BLOCK-START
-"""Initial compact sketch DSL for SyCCL config-driven tasks."""
-
-import os
-
-
-HOST_NUM = int(os.environ.get("SYCCL_TASK_HOST_NUM", "4"))
-HOST_GPU_NUM = int(os.environ.get("SYCCL_TASK_HOST_GPU_NUM", "8"))
-TOPOLOGY = os.environ.get("SYCCL_TASK_TOPOLOGY", "clos").lower()
-CROSS_LAYER = int(os.environ.get("SYCCL_TASK_CROSS_LAYER", "4"))
-CROSS_GROUP = int(os.environ.get("SYCCL_TASK_CROSS_GROUP", "0"))
-NGPUS = int(os.environ.get("SYCCL_TASK_NGPUS", str(HOST_NUM * HOST_GPU_NUM)))
-ROOT_GPU = 0
-
-
-def host_gpus(host_id):
-  base = host_id * HOST_GPU_NUM
-  return list(range(base, base + HOST_GPU_NUM))
-
+"""Initial double-ring compact sketch DSL for SyCCL config-driven tasks."""
 
 def tx(step, layer, group, srcs, dsts):
   """Return one compact DSL transmission.
 
-  Fields are (step, layer, group, srcs, dsts).  srcs/dsts may be either a
+  Fields are (step, layer, group, srcs, dsts). srcs/dsts may be either a
   single GPU id or a list of GPU ids.
   """
   return (step, layer, group, srcs, dsts)
+def construct_sketches(ngpus: int = 1024,root_gpu: int = 0, gpus_per_host: int = 8, hosts_per_leaf: int = 2):
+  """Return a single-root double-ring broadcast sketch in compact DSL form."""
+  ngpus = ngpus
+  root_gpu = root_gpu
+  gpus_per_host = gpus_per_host
+  hosts_per_leaf = hosts_per_leaf
 
+  def ring_gpu(offset):
+    return (root_gpu + offset) % ngpus
 
-def construct_sketches():
-  """Return candidate single-root broadcast sketches in compact DSL form."""
+  def host_id(gpu):
+    return gpu // gpus_per_host
+
+  def leaf_id(gpu):
+    return host_id(gpu) // hosts_per_leaf
+  ## choose the nearest layer and group for src and dst
+  def nearest_layer_group(src, dst):
+    if host_id(src) == host_id(dst):
+      return 1, host_id(src)
+    if leaf_id(src) == leaf_id(dst):
+      return 3, leaf_id(src)
+    return 4, 0
+
   sketch = []
-  if HOST_GPU_NUM > 1:
-    sketch.append(tx(0, 1, 0, ROOT_GPU, host_gpus(0)[1:]))
+  if ngpus <= 1:
+    return sketch
 
-  remote_roots = [host * HOST_GPU_NUM for host in range(1, HOST_NUM)]
-  if remote_roots:
-    sketch.append(tx(0, CROSS_LAYER, CROSS_GROUP, ROOT_GPU, remote_roots))
+  left_front = root_gpu
+  right_front = root_gpu
+  remaining = ngpus - 1
+  step = 0
 
-  for host in range(1, HOST_NUM):
-    gpus = host_gpus(host)
-    if len(gpus) > 1:
-      sketch.append(tx(1, 1, host, gpus[0], gpus[1:]))
+  while remaining > 0:
+    if remaining >= 1:
+      left_dst = ring_gpu(step + 1)
+      layer, group = nearest_layer_group(left_front, left_dst)
+      sketch.append(tx(step, layer, group, left_front, left_dst))
+      left_front = left_dst
+      remaining -= 1
 
-  return [sketch]
+    if remaining >= 1:
+      right_dst = ring_gpu(-(step + 1))
+      layer, group = nearest_layer_group(right_front, right_dst)
+      sketch.append(tx(step, layer, group, right_front, right_dst))
+      right_front = right_dst
+      remaining -= 1
+
+    step += 1
+
+  return sketch
 
 
 # EVOLVE-BLOCK-END

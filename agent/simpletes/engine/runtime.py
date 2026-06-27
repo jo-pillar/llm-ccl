@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from simpletes.evaluator import rich_print, TEMP_EVAL_DIR
+from simpletes.evaluator import FatalEvaluatorError, rich_print, TEMP_EVAL_DIR
 from simpletes.generator import GenerationResult
 from simpletes.node import Node, Status
 
@@ -81,6 +81,13 @@ class RuntimeBase:
         raise NotImplementedError("RuntimeBase.run must be implemented by subclasses")
 
 
+def _first_fatal_worker_error(results: list[object]) -> FatalEvaluatorError | None:
+    for result in results:
+        if isinstance(result, FatalEvaluatorError):
+            return result
+    return None
+
+
 class LocalRuntime(RuntimeBase):
     """Single-node, in-process runtime."""
 
@@ -111,9 +118,14 @@ class LocalRuntime(RuntimeBase):
         for w in all_workers:
             w.cancel()
 
+        worker_results: list[object] = []
         if all_workers:
             rich_print(engine._log("⚠", f"[yellow][dim]Stopping {len(all_workers)} workers...[/dim][/yellow]"))
-            await asyncio.gather(*all_workers, return_exceptions=True)
+            worker_results = await asyncio.gather(*all_workers, return_exceptions=True)
+
+        fatal_error = _first_fatal_worker_error(worker_results)
+        if fatal_error is not None:
+            raise fatal_error
 
         # Drain queues
         for q in (engine.gen_queue, engine.eval_queue):

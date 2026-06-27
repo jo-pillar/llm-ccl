@@ -13,15 +13,16 @@ agent/datasets/syccl/scheme1_direct_events/
 ```
 
 `scheme1_direct_events` evolves Python code that returns a compact single-root
-broadcast sketch. The evaluator validates the sketch, expands it into SyCCL
-direct events, runs `build/synthesize ... resim --sketch`, and scores the
+broadcast sketch. The evaluator validates the sketch, writes
+`candidate-sketch.json`, runs `flow-sim-rs batch-sketch`, and scores the
 candidate with:
 
 ```text
-combined_score = -best_time_us
+combined_score = coll.byte / simulated_time_us
 ```
 
-Higher score is better.
+Higher score is better. For a fixed config, this means minimizing flow-sim-rs
+`time_us`.
 
 ## What Was Added
 
@@ -60,8 +61,8 @@ The evaluator also returns structured failure metadata for invalid sketches:
 ```
 
 Current categories include dependency errors, duplicate destinations, incomplete
-coverage, topology group errors, DSL schema errors, SyCCL timeouts, SyCCL runtime
-errors, and `syccl_expand_incompatible`.
+coverage, topology group errors, DSL schema errors, flow-sim timeouts,
+flow-sim runtime errors, and flow-sim output errors.
 
 Important limitation: SimpleTES's built-in failure-pattern prompt currently
 summarizes `metrics["error"]`. It records failure history, but it does not yet
@@ -75,19 +76,17 @@ From the repository root:
 cd /home/antl/wzd/syccl
 ```
 
-Build SyCCL first. The evaluator expects:
+Build flow-sim-rs first. The evaluator expects:
 
 ```text
-/home/antl/wzd/syccl/build/synthesize
+/home/antl/wzd/llm-ccl/Flow-Simulator/flow-sim-rs/target/release/flow-sim-rs
 ```
 
-A typical build is:
+Override the binary path with `FLOW_SIM_BIN` if needed. A typical build is:
 
 ```bash
-mkdir -p build
-cd build
-cmake .. -DSCIP_SUITE_DIR=/path/to/SCIP -DSCIP_PP_DIR=/path/to/SCIPpp
-make -j
+cd /home/antl/wzd/llm-ccl/Flow-Simulator/flow-sim-rs
+cargo build --release
 ```
 
 Install the SimpleTES Python environment:
@@ -114,119 +113,48 @@ api_key = "..."
 `agent/scripts/run_syccl_simpletes.py` reads this file and forwards `model`,
 `api_base`, and `api_key` to `main.py`.
 
-## Generate SyCCL Experiment Configs
+## Prepare TopoDSL Inputs
 
-Use `scripts/syccl_config_matrix.py` from the repository root. The generated
-manifest is the handoff file used by both SyCCL batch runs and SimpleTES runs.
-
-Available cases:
+The SimpleTES launcher now takes three user inputs:
 
 ```text
-clos-4host          4 hosts x 8 GPUs = 32 GPUs
-clos-128gpu         16 hosts x 8 GPUs = 128 GPUs
-multirail-4host     4 hosts x 8 GPUs = 32 GPUs
-multirail-512gpu    64 hosts x 8 GPUs = 512 GPUs
+TOPODSL=/path/to/topology.py
+--init-program /path/to/ring_init.py
+--instruction /path/to/prompt_templete.txt
 ```
 
-Available collectives:
+`TOPODSL` is mandatory and must point to a TopoDSL file. The launcher parses it,
+derives the GPU count, collective, message size, and topology parameters, then
+writes the flow-sim config used by the evaluator. Supported topology families
+are `clos` and `multirail`.
 
-```text
-allgather
-alltoall
+The init program must expose one of these functions:
+
+```python
+def construct_sketches(GPU_NUM):
+    ...
+
+def build_initial_sketch(GPU_NUM):
+    ...
 ```
 
-Generate one 512-GPU multirail allgather config:
-
-```bash
-cd /home/antl/wzd/syccl
-
-python3 scripts/syccl_config_matrix.py \
-  --output-root /home/antl/mntdisk/syccl-llm-scheme1-direct-events \
-  --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-multirail512-ag-4k.json \
-  --case multirail-512gpu \
-  --collective allgather \
-  --coll-bytes 4K
-```
-
-Generate several message sizes for the same case:
-
-```bash
-cd /home/antl/wzd/syccl
-
-python3 scripts/syccl_config_matrix.py \
-  --output-root /home/antl/mntdisk/syccl-llm-scheme1-direct-events \
-  --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-multirail512-ag.json \
-  --case multirail-512gpu \
-  --collective allgather \
-  --coll-bytes 4K,512K,1M,16M
-```
-
-Generate a full matrix for selected cases and collectives:
-
-```bash
-cd /home/antl/wzd/syccl
-
-python3 scripts/syccl_config_matrix.py \
-  --output-root /home/antl/mntdisk/syccl-llm-scheme1-direct-events \
-  --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-selected.json \
-  --case clos-128gpu \
-  --case multirail-512gpu \
-  --collective allgather \
-  --collective alltoall \
-  --coll-bytes 4K,512K,1M,16M
-```
-
-Use `--dry-run` to preview entries without writing configs:
-
-```bash
-python3 scripts/syccl_config_matrix.py \
-  --case multirail-512gpu \
-  --collective allgather \
-  --coll-bytes 4K \
-  --dry-run
-```
-
-## Optional: Run Baseline SyCCL Solves
-
-The SimpleTES evaluator uses direct resimulation of generated sketches, so a
-baseline solve is not required before running SimpleTES. It can still be useful
-for comparison.
-
-Run every entry in a manifest:
-
-```bash
-cd /home/antl/wzd/syccl
-
-python3 scripts/runexp.py \
-  --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-selected.json \
-  --solver /home/antl/wzd/syccl/build/synthesize
-```
-
-Run only one entry:
-
-```bash
-python3 scripts/runexp.py \
-  --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-selected.json \
-  --solver /home/antl/wzd/syccl/build/synthesize \
-  --case multirail-512gpu \
-  --collective allgather \
-  --coll-byte 4K
-```
+The instruction file is a template. The launcher fills placeholders such as
+`${GPU_NUM}`, `${Collective}`, `${TOPOLOGY}`, `${MESSAGE_SIZE}`,
+`${TOPOLOGY_SUMMARY}`, and `${LAYER_GROUP_SUMMARY}`.
 
 ## Run SimpleTES On One SyCCL Case
 
 Use `agent/scripts/run_syccl_simpletes.py` from the `agent/` directory.
 
-Run 512-GPU multirail allgather, 4 KiB:
+Run one TopoDSL task:
 
 ```bash
 cd /home/antl/wzd/syccl/agent
 
+TOPODSL=/home/antl/wzd/llm-ccl/agent/examples/topologies/multirail_topo.py \
 uv run python scripts/run_syccl_simpletes.py \
-  --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-multirail512-ag-4k.json \
-  --case multirail-512gpu \
-  --collective allgather \
-  --coll-byte 4K \
+  --init-program datasets/syccl/scheme1_direct_events/init_program.py \
+  --instruction datasets/syccl/scheme1_direct_events/prompt_templete.txt \
   --condition full \
   --max-generations 10000 \
   --save-llm-io
@@ -249,11 +177,10 @@ Run an ablation:
 ```bash
 cd /home/antl/wzd/syccl/agent
 
+TOPODSL=/home/antl/wzd/llm-ccl/agent/examples/topologies/multirail_topo.py \
 uv run python scripts/run_syccl_simpletes.py \
-  --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-multirail512-ag-4k.json \
-  --case multirail-512gpu \
-  --collective allgather \
-  --coll-byte 4K \
+  --init-program datasets/syccl/scheme1_direct_events/init_program.py \
+  --instruction datasets/syccl/scheme1_direct_events/prompt_templete.txt \
   --condition ablation \
   --max-generations 10000 \
   --save-llm-io
@@ -274,50 +201,14 @@ Preview the exact command and SyCCL environment without starting the run:
 ```bash
 cd /home/antl/wzd/syccl/agent
 
+TOPODSL=/home/antl/wzd/llm-ccl/agent/examples/topologies/multirail_topo.py \
 uv run python scripts/run_syccl_simpletes.py \
-  --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-multirail512-ag-4k.json \
-  --case multirail-512gpu \
-  --collective allgather \
-  --coll-byte 4K \
+  --init-program datasets/syccl/scheme1_direct_events/init_program.py \
+  --instruction datasets/syccl/scheme1_direct_events/prompt_templete.txt \
   --condition full \
   --max-generations 10000 \
   --save-llm-io \
   --dry-run
-```
-
-## Run Several Message Sizes
-
-After generating a manifest with multiple `--coll-bytes`, run one SimpleTES
-search per size:
-
-```bash
-cd /home/antl/wzd/syccl/agent
-
-for s in 4K 512K 1M 16M; do
-  uv run python scripts/run_syccl_simpletes.py \
-    --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-multirail512-ag.json \
-    --case multirail-512gpu \
-    --collective allgather \
-    --coll-byte "$s" \
-    --condition full \
-    --max-generations 10000 \
-    --save-llm-io
-done
-```
-
-For alltoall, generate the manifest with `--collective alltoall`, then run:
-
-```bash
-cd /home/antl/wzd/syccl/agent
-
-uv run python scripts/run_syccl_simpletes.py \
-  --manifest /home/antl/mntdisk/syccl-llm-scheme1-direct-events/manifest-multirail512-a2a-4k.json \
-  --case multirail-512gpu \
-  --collective alltoall \
-  --coll-byte 4K \
-  --condition full \
-  --max-generations 10000 \
-  --save-llm-io
 ```
 
 ## Output Layout
@@ -345,8 +236,9 @@ eval_artifacts/scheme1_direct_events/eval_.../program.py
   The candidate program evaluated in that attempt.
 
 eval_artifacts/scheme1_direct_events/eval_.../metrics.json
-  Evaluator metrics, including validity, best_time_us, failure_category, and
-  failure_feedback when the candidate fails.
+  Evaluator metrics, including combined_score, validity, eval_s,
+  bottleneck_profile, failure_category, and failure_feedback when the candidate
+  fails.
 
 checkpoints/<date>/instance-.../run.log
   SimpleTES runtime log.
@@ -404,19 +296,13 @@ history.
 ## Failure Feedback Notes
 
 The SyCCL evaluator's structured feedback is written to `metrics.json` and
-`nodes.json`. For example, `syccl_expand_incompatible` means the compact sketch
-could not be expanded by SyCCL's topology-symmetry mapping, often because a
-transmission used an over-broad layer/group or produced mapped src/dst set size
-changes.
-
-Do not treat `syccl_expand_incompatible` as a harmless warning unless the
-evaluator can still produce a valid `best_time_us`. The safer experiment is to
-keep the candidate invalid while improving the prompt feedback text shown to the
-model.
+`nodes.json`. Valid candidates include a `bottleneck_profile` from flow-sim-rs
+with `critical_flow_chain` information from the simulator. Invalid candidates
+include `failure_category` and `failure_feedback`.
 
 ## Common Pitfalls
 
-- `build/synthesize` is missing: build SyCCL before running SimpleTES.
+- `flow-sim-rs` is missing: build flow-sim-rs or set `FLOW_SIM_BIN`.
 - No failure feedback appears in prompts: check that the run is `--condition full`,
   not ablation, and inspect prompts after at least one batch has completed.
 - No `llm_input` in `nodes.json`: rerun with `--save-llm-io`.

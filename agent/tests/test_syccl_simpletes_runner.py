@@ -1,5 +1,10 @@
+import contextlib
+import io
 import importlib.util
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,151 +23,272 @@ def load_runner():
   return module
 
 
-def write_manifest(tmp_path: Path) -> Path:
-  config_path = tmp_path / "clos-4host-ag-4k.json"
-  config_path.write_text(
-      json.dumps({
-          "coll": {"name": "allgather", "byte": 4096},
-          "hosts": {"host_num": 4, "host_gpu_num": 8, "host_nic_num": 4},
-          "topo": [],
-          "sketch": {},
-          "algo_solve": {"solve_output": str(tmp_path / "result.json")},
-      }),
+def write_topodsl(path: Path, *, family: str = "clos") -> None:
+  if family == "clos":
+    body = """
+###TopoBegin
+def topology():
+  return {
+    "family": "clos",
+    "hosts": 2,
+    "gpus_per_host": 4,
+    "nics_per_host": 1,
+    "leaf_switches": 1,
+    "spine_switches": 1,
+    "message_size": 4096,
+    "collective": "allgather",
+  }
+###TopoEND
+""".lstrip()
+  else:
+    body = """
+###TopoBegin
+def topology():
+  return {
+    "family": "multirail",
+    "hosts": 2,
+    "gpus_per_host": 4,
+    "nics_per_host": 4,
+    "rails": 4,
+    "message_size": 8192,
+    "collective": "allgather",
+  }
+###TopoEND
+""".lstrip()
+  path.write_text(body, encoding="utf-8")
+
+
+def write_init_program(path: Path) -> None:
+  path.write_text(
+      """
+# EVOLVE-BLOCK-START
+def construct_sketches(GPU_NUM):
+  return [[(0, 1, 0, 0, list(range(1, GPU_NUM)))]]
+# EVOLVE-BLOCK-END
+""".lstrip(),
       encoding="utf-8",
   )
-  manifest_path = tmp_path / "manifest.json"
-  manifest_path.write_text(
-      json.dumps({
-          "entries": [
-              {
-                  "case_id": "clos-4host",
-                  "topology": "clos",
-                  "collective": "allgather",
-                  "coll_byte_B": 4096,
-                  "config_path": str(config_path),
-                  "result_path": str(tmp_path / "result.json"),
-                  "log_path": str(tmp_path / "run.log"),
-              }
-          ]
-      }),
-      encoding="utf-8",
-  )
-  return manifest_path
 
 
 class SycclSimpletesRunnerTest(unittest.TestCase):
-  def test_runner_selects_manifest_entry_by_case_collective_and_coll_byte(self):
+  def test_missing_topodsl_env_is_fatal(self):
+    runner = load_runner()
+
+    with patch.dict("os.environ", {}, clear=True):
+      with self.assertRaisesRegex(SystemExit, "TOPODSL"):
+        runner.load_required_topodsl_from_env()
+
+  def test_topodsl_env_must_point_to_existing_file(self):
+    runner = load_runner()
+
+    with patch.dict("os.environ", {"TOPODSL": "/tmp/does-not-exist.topo"}, clear=True):
+      with self.assertRaisesRegex(SystemExit, "does not exist"):
+        runner.load_required_topodsl_from_env()
+
+  def test_build_command_generates_config_instruction_and_init_wrapper(self):
     with tempfile.TemporaryDirectory(prefix="syccl_runner_") as tmp:
       tmp_path = Path(tmp)
-      runner = load_runner()
-      manifest = runner.load_manifest(write_manifest(tmp_path))
-
-      entry = runner.select_entry(
-          manifest,
-          case_id="clos-4host",
-          collective="allgather",
-          coll_byte=4096,
-      )
-
-      self.assertTrue(entry["config_path"].endswith("clos-4host-ag-4k.json"))
-
-
-  def test_runner_builds_distinct_full_and_ablation_commands(self):
-    with tempfile.TemporaryDirectory(prefix="syccl_runner_") as tmp:
-      tmp_path = Path(tmp)
-      runner = load_runner()
-      manifest = runner.load_manifest(write_manifest(tmp_path))
-      entry = runner.select_entry(manifest, "clos-4host", "allgather", 4096)
-
-      full = runner.build_command(entry, condition="full", max_generations=10000)
-      ablation = runner.build_command(entry, condition="ablation", max_generations=10000)
-
-      full_cmd = full.command
-      ablation_cmd = ablation.command
-      self.assertIn("--init-program", full_cmd)
-      self.assertIn("--evaluator", full_cmd)
-      self.assertIn("--max-generations", full_cmd)
-      self.assertIn("10000", full_cmd)
-      self.assertIn("--include-construction", full_cmd)
-      self.assertNotIn("--num-inspirations", full_cmd)
-
-      self.assertIn("--disable-reflection", ablation_cmd)
-      self.assertIn("--num-inspirations", ablation_cmd)
-      self.assertIn("0", ablation_cmd)
-      self.assertIn("--num-chains", ablation_cmd)
-      self.assertIn("1", ablation_cmd)
-      self.assertIn("--k-candidates", ablation_cmd)
-      self.assertIn("1", ablation_cmd)
-      self.assertNotIn("--include-construction", ablation_cmd)
-      self.assertEqual(full.env["SYCCL_BASE_CONFIG"], ablation.env["SYCCL_BASE_CONFIG"])
-
-  def test_runner_can_forward_skip_preflight(self):
-    with tempfile.TemporaryDirectory(prefix="syccl_runner_") as tmp:
-      tmp_path = Path(tmp)
-      runner = load_runner()
-      manifest = runner.load_manifest(write_manifest(tmp_path))
-      entry = runner.select_entry(manifest, "clos-4host", "allgather", 4096)
-
-      spec = runner.build_command(
-          entry,
-          condition="full",
-          max_generations=10000,
-          skip_preflight=True,
-      )
-
-      self.assertIn("--skip-preflight", spec.command)
-
-  def test_runner_can_forward_save_llm_io(self):
-    with tempfile.TemporaryDirectory(prefix="syccl_runner_") as tmp:
-      tmp_path = Path(tmp)
-      runner = load_runner()
-      manifest = runner.load_manifest(write_manifest(tmp_path))
-      entry = runner.select_entry(manifest, "clos-4host", "allgather", 4096)
-
-      spec = runner.build_command(
-          entry,
-          condition="full",
-          max_generations=10000,
-          save_llm_io=True,
-      )
-
-      self.assertIn("--save-llm-io", spec.command)
-
-  def test_runner_bypasses_proxy_for_private_api_base(self):
-    with tempfile.TemporaryDirectory(prefix="syccl_runner_") as tmp:
-      tmp_path = Path(tmp)
-      env_toml = tmp_path / "env.toml"
-      env_toml.write_text(
-          "\n".join([
-              'model = "hosted_vllm/test"',
-              'api_base = "http://192.168.208.232:8000/v1"',
-              'api_key = "sk-no-key-required"',
-          ]),
+      topo_path = tmp_path / "topo.py"
+      init_path = tmp_path / "ring_init.py"
+      template_path = tmp_path / "prompt_templete.txt"
+      output_root = tmp_path / "out"
+      write_topodsl(topo_path)
+      write_init_program(init_path)
+      template_path.write_text(
+          "GPU=${GPU_NUM} coll=${Collective} topo=${TOPOLOGY} bytes=${MESSAGE_SIZE}",
           encoding="utf-8",
       )
       runner = load_runner()
-      manifest = runner.load_manifest(write_manifest(tmp_path))
-      entry = runner.select_entry(manifest, "clos-4host", "allgather", 4096)
 
-      with patch.dict(
-          "os.environ",
-          {
-              "HTTP_PROXY": "http://127.0.0.1:7897",
-              "HTTPS_PROXY": "http://127.0.0.1:7897",
-              "NO_PROXY": "127.0.0.1,localhost",
-              "no_proxy": "127.0.0.1,localhost",
-          },
-          clear=False,
-      ):
-        spec = runner.build_command(
-            entry,
-            condition="full",
-            max_generations=10000,
-            env_toml=env_toml,
-        )
+      with patch.dict("os.environ", {"TOPODSL": str(topo_path)}, clear=False):
+        topo = runner.load_required_topodsl_from_env()
+      spec = runner.build_command(
+          topo,
+          init_program=init_path,
+          instruction_template=template_path,
+          max_generations=10000,
+          output_root=output_root,
+          env_toml=None,
+          save_llm_io=True,
+      )
 
-      self.assertIn("192.168.208.232", spec.env["NO_PROXY"].split(","))
-      self.assertIn("192.168.208.232", spec.env["no_proxy"].split(","))
+      env = {key: value for key, value in spec.env.items() if key.startswith("SYCCL_")}
+      self.assertEqual({"SYCCL_BASE_CONFIG", "SYCCL_EVAL_ARTIFACT_DIR"}, set(env))
+      self.assertIn("--save-llm-io", spec.command)
+      self.assertIn("--init-program", spec.command)
+      self.assertIn(str(spec.init_program_path), spec.command)
+      self.assertIn("--instruction", spec.command)
+      self.assertIn(str(spec.instruction_path), spec.command)
+
+      config = json.loads(spec.config_path.read_text(encoding="utf-8"))
+      self.assertEqual({"name": "allgather", "byte": 4096, "root_sender": -1, "root_receiver": -1}, config["coll"])
+      self.assertEqual({"host_num": 2, "host_gpu_num": 4, "host_nic_num": 1, "host_links": "nvswitch"}, config["hosts"])
+      self.assertEqual("pod", config["topo"][-1]["switch_topo"])
+
+      instruction = spec.instruction_path.read_text(encoding="utf-8")
+      self.assertIn("GPU=8", instruction)
+      self.assertIn("coll=allgather", instruction)
+      self.assertIn("topo=###TopoBegin", instruction)
+      self.assertIn("def topology():", instruction)
+      self.assertIn("###TopoEND", instruction)
+      self.assertIn('"family": "clos"', instruction)
+      self.assertIn("bytes=4096", instruction)
+      self.assertNotIn("total_gpus=8", instruction)
+      self.assertNotIn("layer 1 group 0", instruction)
+
+      init_wrapper = spec.init_program_path.read_text(encoding="utf-8")
+      self.assertIn("GPU_NUM = 8", init_wrapper)
+      self.assertIn("# EVOLVE-BLOCK-START", init_wrapper)
+      self.assertIn("def construct_sketches(GPU_NUM):", init_wrapper)
+      self.assertIn("return construct_sketches(GPU_NUM)", init_wrapper)
+      self.assertNotIn("USER_INIT_PATH", init_wrapper)
+      self.assertNotIn("_INITIAL_CONSTRUCT_SKETCHES", init_wrapper)
+      prefix, evolve_and_suffix = init_wrapper.split("# EVOLVE-BLOCK-START", 1)
+      evolve, _suffix = evolve_and_suffix.split("# EVOLVE-BLOCK-END", 1)
+      self.assertNotIn("_load_user_init", prefix)
+      self.assertNotIn("_load_user_init", evolve)
+
+  def test_multirail_topodsl_generates_multirail_config(self):
+    with tempfile.TemporaryDirectory(prefix="syccl_runner_") as tmp:
+      tmp_path = Path(tmp)
+      topo_path = tmp_path / "topo.py"
+      init_path = tmp_path / "ring_init.py"
+      template_path = tmp_path / "prompt_templete.txt"
+      write_topodsl(topo_path, family="multirail")
+      write_init_program(init_path)
+      template_path.write_text("${GPU_NUM} ${TOPOLOGY_FAMILY} ${TOPOLOGY}", encoding="utf-8")
+      runner = load_runner()
+
+      with patch.dict("os.environ", {"TOPODSL": str(topo_path)}, clear=False):
+        topo = runner.load_required_topodsl_from_env()
+      spec = runner.build_command(
+          topo,
+          init_program=init_path,
+          instruction_template=template_path,
+          max_generations=10,
+          output_root=tmp_path / "out",
+          env_toml=None,
+      )
+
+      config = json.loads(spec.config_path.read_text(encoding="utf-8"))
+      self.assertEqual(8192, config["coll"]["byte"])
+      self.assertEqual("multirail", config["topo"][-1]["switch_topo"])
+      self.assertEqual(4, config["topo"][-1]["switch_num"])
+      self.assertIn("8 multirail", spec.instruction_path.read_text(encoding="utf-8"))
+
+  def test_rendered_init_program_accepts_build_initial_sketch_alias(self):
+    with tempfile.TemporaryDirectory(prefix="syccl_runner_") as tmp:
+      tmp_path = Path(tmp)
+      user_init = tmp_path / "init_alias.py"
+      rendered = tmp_path / "rendered_init.py"
+      user_init.write_text(
+          """
+# EVOLVE-BLOCK-START
+def construct_sketches(GPU_NUM):
+  return [[(0, 1, 0, 0, GPU_NUM - 1)]]
+# EVOLVE-BLOCK-END
+""".lstrip(),
+          encoding="utf-8",
+      )
+      runner = load_runner()
+
+      runner.write_init_program(user_init, rendered, gpu_num=8)
+      namespace: dict[str, object] = {}
+      exec(rendered.read_text(encoding="utf-8"), namespace, namespace)
+
+      self.assertEqual([[(0, 1, 0, 0, 7)]], namespace["run_code"]())
+
+  def test_main_dry_run_uses_topodsl_env_and_new_cli_inputs(self):
+    with tempfile.TemporaryDirectory(prefix="syccl_runner_") as tmp:
+      tmp_path = Path(tmp)
+      topo_path = tmp_path / "topo.py"
+      init_path = tmp_path / "ring_init.py"
+      template_path = tmp_path / "prompt_templete.txt"
+      output_root = tmp_path / "out"
+      write_topodsl(topo_path)
+      write_init_program(init_path)
+      template_path.write_text("GPU=${GPU_NUM}", encoding="utf-8")
+      runner = load_runner()
+
+      with patch.dict("os.environ", {"TOPODSL": str(topo_path)}, clear=False):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+          result = runner.main([
+              "--init-program",
+              str(init_path),
+              "--instruction",
+              str(template_path),
+              "--max-generations",
+              "1",
+              "--output-root",
+              str(output_root),
+              "--env-toml",
+              str(tmp_path / "missing-env.toml"),
+              "--dry-run",
+          ])
+
+      self.assertEqual(0, result)
+      self.assertIn("SimpleTES command:", stdout.getvalue())
+      self.assertIn("uv run python main.py", stdout.getvalue())
+      generated = list(output_root.glob("*/clos/allgather/4k/FULL/generated/flow-sim-config.json"))
+      self.assertEqual(1, len(generated))
+
+  def test_old_manifest_cli_is_rejected(self):
+    runner = load_runner()
+
+    with contextlib.redirect_stderr(io.StringIO()):
+      with self.assertRaises(SystemExit):
+        runner._parse_args([
+            "--manifest",
+            "manifest.json",
+            "--case",
+            "clos",
+            "--coll-byte",
+            "4K",
+            "--condition",
+            "full",
+        ])
+
+  def test_script_can_run_directly_from_scripts_path(self):
+    with tempfile.TemporaryDirectory(prefix="syccl_runner_") as tmp:
+      tmp_path = Path(tmp)
+      topo_path = tmp_path / "topo.py"
+      init_path = tmp_path / "ring_init.py"
+      template_path = tmp_path / "prompt_templete.txt"
+      output_root = tmp_path / "out"
+      write_topodsl(topo_path)
+      write_init_program(init_path)
+      template_path.write_text("GPU=${GPU_NUM}", encoding="utf-8")
+      env = os.environ.copy()
+      env["TOPODSL"] = str(topo_path)
+
+      proc = subprocess.run(
+          [
+              sys.executable,
+              str(RUNNER_PATH),
+              "--init-program",
+              str(init_path),
+              "--instruction",
+              str(template_path),
+              "--max-generations",
+              "1",
+              "--output-root",
+              str(output_root),
+              "--env-toml",
+              str(tmp_path / "missing-env.toml"),
+              "--dry-run",
+          ],
+          cwd=str(ROOT / "agent"),
+          env=env,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE,
+          text=True,
+          check=False,
+      )
+
+      self.assertEqual("", proc.stderr)
+      self.assertEqual(0, proc.returncode)
+      self.assertIn("SYCCL_BASE_CONFIG", proc.stdout)
 
 
 if __name__ == "__main__":

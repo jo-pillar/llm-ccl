@@ -48,6 +48,10 @@ class EvaluationOutcome:
     captured_construction_payload: Any | None = None
 
 
+class FatalEvaluatorError(RuntimeError):
+    """Evaluator reported a process-fatal error; stop the current run."""
+
+
 class Evaluator(Protocol):
     """Protocol for custom evaluators.
     
@@ -106,8 +110,18 @@ def main():
         print(json.dumps(result))
         
     except Exception as e:
-        error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-        print(json.dumps({"error": error_msg, "combined_score": float("-inf")}))
+        if getattr(e, "simpletes_fatal", False):
+            try:
+                result = json.loads(str(e))
+                if not isinstance(result, dict):
+                    raise ValueError("fatal payload must be a JSON object")
+            except Exception:
+                result = {"error": str(e), "combined_score": float("-inf")}
+            result["simpletes_fatal"] = True
+        else:
+            error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            result = {"error": error_msg, "combined_score": float("-inf")}
+        print(json.dumps(result))
         sys.exit(1)
 
 if __name__ == "__main__":
@@ -170,6 +184,13 @@ class EvaluatorWorker:
         )
         return env
 
+    def _raise_if_fatal(self, metrics: Any) -> None:
+        if isinstance(metrics, dict) and metrics.get("simpletes_fatal"):
+            error = metrics.get("error")
+            if not error:
+                error = json.dumps(metrics, ensure_ascii=True, sort_keys=True, default=str)
+            raise FatalEvaluatorError(f"Fatal evaluator error: {error}")
+
     async def evaluate(
         self,
         code: str,
@@ -231,6 +252,8 @@ class EvaluatorWorker:
 
             if proc.returncode != 0:
                 error_msg = stderr_text or stdout_text or f"Process exited with code {proc.returncode}"
+                parsed_metrics = self._parse_json_from_output(stdout_text)
+                self._raise_if_fatal(parsed_metrics)
                 rich_print(
                     f"[red][{self.instance_id}][/red] [red]✗[/red] "
                     f"[bold red]Evaluation error:[/bold red] {error_msg[:200]}"
@@ -240,6 +263,7 @@ class EvaluatorWorker:
                 return EvaluationOutcome(metrics=metrics)
 
             metrics = self._parse_json_from_output(stdout_text)
+            self._raise_if_fatal(metrics)
             truncate_error_in_metrics(metrics, max_chars=DEFAULT_METRICS_ERROR_MAX_CHARS)
             payload = None
             if os.path.exists(capture_path):

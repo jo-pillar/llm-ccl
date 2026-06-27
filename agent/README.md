@@ -352,3 +352,14 @@ Practical summary:
 <p align="center">
   <img src="picture/will-symbol-c.png" alt="WILL" height="55">
 </p>
+
+
+[【1,2,3,4],[2,3,4,6],]
+
+233节点 对开源大模型做evaluation  logits lens。 注意力归因看上下文， 用这个方式去分析为什么topodsl 有用。 用注意力分析
+跟传统搜索框架的区别是什么？
+我的设计是有用的 第二 非这个设计不可（指的是  strawman的solution 不可。trival的方案不可，
+
+
+
+

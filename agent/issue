@@ -1,0 +1,8 @@
+1 参考https://docs.litellm.ai/docs/completion/prompt_caching 补上每轮的缓存命中token统计，将其加和汇总，统计记录到最后的summary.json当中。
+2 为什么同样是error,有的会有relection,有的没有
+#3 [Score: -10000000000.000000]
+   Metrics: combined_score=-1000000000000.0000, validity=0.0000, bottleneck_profile=None, failure_category=flow_sim_sketch_error, failure_feedback=unsupported layer 4; allowed layers are [1, 3]
+
+#4 [Score: -10000000000.000000]
+   Metrics: combined_score=-1000000000000.0000, validity=0.0000, bottleneck_profile=None, failure_category=flow_sim_timeout, failure_feedback=flow-sim-rs timed out evaluating this sketch batch. Prefer fewer candidate sketches and simpler dependency structure.
+   Reflection: Approach: The solution attempted a binomial-tree broadcast per rail, where the root GPU on each rail (the GPU with that rail index in host 0) sends to one other host in step 1, then in each subsequent step the set of senders doubles and sends to an equal number of new recipients. This yields a total of 7 steps (one intra-host and six rail steps). The sketch used a compact form where multiple srcs and dsts are listed per transmission, allowing multiple simultaneous sends within a single step per rail group. The goal was to minimize depth while keeping all rails concurrent, and the chosen tree structure was expected to rotate into a balanced allgather schedule.

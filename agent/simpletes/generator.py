@@ -5,6 +5,8 @@ Handles LLM client lifecycle, prompt building, and code extraction.
 """
 from __future__ import annotations
 
+import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -24,6 +26,23 @@ if TYPE_CHECKING:
     pass
 
 _PROMPT_ERROR_MAX_CHARS = 240
+_LLM_IO_LOGGER_NAME = "simpletes.llm_io"
+
+
+class _CurrentStdoutHandler(logging.StreamHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        self.stream = sys.stdout
+        super().emit(record)
+
+
+_llm_io_logger = logging.getLogger(_LLM_IO_LOGGER_NAME)
+if not _llm_io_logger.handlers:
+    _handler = _CurrentStdoutHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _llm_io_logger.addHandler(_handler)
+_llm_io_logger.setLevel(logging.DEBUG)
+_llm_io_logger.propagate = False
+
 _CODE_FENCE_TAG_BY_SUFFIX = {
     ".py": "python",
     ".rs": "rust",
@@ -258,7 +277,7 @@ class Generator:
                 i,
                 node.code,
                 node.score,
-                node.metrics,
+                None,
                 node.reflection,
                 self._code_fence_tag,
             )
@@ -360,12 +379,29 @@ class Generator:
         Returns a list of GenerationResult, one per LLM response.
         May return fewer than task.k results if LLM fails.
         """
+        _llm_io_logger.debug(
+            "LLM prompt start instance_id=%s gen_id=%s chain_idx=%s k=%s\n%s\nLLM prompt end",
+            instance_id,
+            task.gen_id,
+            task.chain_idx,
+            task.k,
+            task.prompt,
+        )
         llm_results = await self._llm.generate_batch(
             task.prompt, n=task.k, instance_id=instance_id, track_io=track_io
         )
 
         results: list[GenerationResult] = []
-        for llm_result in llm_results:
+        for index, llm_result in enumerate(llm_results):
+            llm_output = getattr(llm_result, "raw_output", None) or llm_result.text
+            _llm_io_logger.debug(
+                "LLM output start instance_id=%s gen_id=%s chain_idx=%s response_index=%s\n%s\nLLM output end",
+                instance_id,
+                task.gen_id,
+                task.chain_idx,
+                index,
+                llm_output,
+            )
             code, reason = extract_code_detailed(llm_result.text, self._evolve_context)
             failure_reason = getattr(llm_result, "error_reason", None) or reason
             if code:
@@ -374,13 +410,13 @@ class Generator:
                     code=code,
                     reason=reason,
                     llm_input=getattr(llm_result, "prompt", None),
-                    llm_output=getattr(llm_result, "raw_output", None) or llm_result.text,
+                    llm_output=llm_output,
                     token_usage=getattr(llm_result, "token_usage", None),
                 ))
             else:
                 results.append(GenerationResult(
                     success=False,
                     reason=failure_reason,
-                    llm_output=getattr(llm_result, "raw_output", None) or llm_result.text,
+                    llm_output=llm_output,
                 ))
         return results

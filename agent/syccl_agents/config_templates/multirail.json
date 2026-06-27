@@ -1,0 +1,115 @@
+{
+  "coll": {
+    "name": "allgather",
+    "byte": 1048576,
+    "root_sender": -1,
+    "root_receiver": -1
+  },
+  "hosts": {
+    "host_num": 4,
+    "host_gpu_num": 8,
+    "host_nic_num": 8,
+    "host_links": "nvlink"
+  },
+  "topo": [
+    {
+      "layer_id": 0,
+      "type": "local",
+      "link_spec": "memcpy"
+    },
+    {
+      "layer_id": 1,
+      "type": "host",
+      "link_spec": "nvlink"
+    },
+    {
+      "layer_id": 2,
+      "type": "nic",
+      "link_spec": "link_nic"
+    },
+    {
+      "layer_id": 3,
+      "type": "switch",
+      "switch_topo": "multirail",
+      "switch_num": 8,
+      "link_spec": "netlink"
+    }
+  ],
+  "host_links": {
+    "torus": {
+      "dim_num": 2,
+      "per_dim_num": [
+        4,
+        4
+      ]
+    },
+    "nvlink": [
+      [
+        1,
+        2,
+        3,
+        5
+      ],
+      [
+        0,
+        2,
+        3,
+        4
+      ],
+      [
+        0,
+        1,
+        3,
+        7
+      ],
+      [
+        0,
+        1,
+        2,
+        6
+      ],
+      [
+        5,
+        6,
+        7,
+        1
+      ],
+      [
+        4,
+        6,
+        7,
+        0
+      ],
+      [
+        4,
+        5,
+        7,
+        3
+      ],
+      [
+        4,
+        5,
+        6,
+        2
+      ]
+    ]
+  },
+  "link_spec": {
+    "memcpy": {
+      "bw_mbpus": 10,
+      "lat_us": 0.01
+    },
+    "nvlink": {
+      "bw_mbpus": 0.3,
+      "lat_us": 9
+    },
+    "link_nic": {
+      "bw_mbpus": 0.0225,
+      "lat_us": 0
+    },
+    "netlink": {
+      "bw_mbpus": 0.0225,
+      "lat_us": 25
+    }
+  }
+}

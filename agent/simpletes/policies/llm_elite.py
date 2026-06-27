@@ -328,6 +328,7 @@ class LLMElitePolicy(TrajectoryPolicyBase):
 
     def _select_from_chain(self, chain_idx: int, chain_nodes: list[Node], n: int) -> list[Node]:
         elite_list = self.elite_sets[chain_idx]
+        print(elite_list)
 
         # Initialize elite pool from chain nodes if empty
         if not elite_list:

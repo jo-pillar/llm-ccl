@@ -1,6 +1,10 @@
 import importlib.util
+import json
 import math
+import subprocess
+import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 EVALUATOR_PATH = (
@@ -22,72 +26,176 @@ def test_error_result_returns_finite_penalty_and_actionable_feedback():
     )
 
     assert math.isfinite(metrics["combined_score"])
-    assert math.isfinite(metrics["best_time_us"])
     assert metrics["validity"] == 0.0
+    assert metrics["bottleneck_profile"] is None
     assert metrics["failure_category"] == "dependency_error"
     assert "GPU 16" in metrics["failure_feedback"]
     assert "step 1" in metrics["failure_feedback"]
+    assert "validity_status" not in metrics
+    assert "best_time_us" not in metrics
+    assert "completion_time" not in metrics
+    assert "expanded_events" not in metrics
 
 
-def test_dependency_error_mentions_same_step_delivery():
-    sketch = [
-        (0, 1, 0, 0, [1, 2, 3, 4, 5, 6, 7]),
-        (0, 4, 0, 0, 8),
-        (1, 4, 0, 0, 16),
-        (1, 1, 2, 16, [17, 18, 19]),
+def test_write_flow_sim_inputs_writes_run_code_output_without_python_sketch_validation():
+    raw = [
+        [(0, 999, 123, 0, [1, 2, 3])],
+        [(0, 1, 0, 0, [[4, 5], [6, 7]])],
     ]
 
-    try:
-        EVALUATOR._normalize_sketches([sketch])
-    except EVALUATOR.SketchValidationError as exc:
-        msg = str(exc)
-    else:
-        raise AssertionError("expected SketchValidationError")
+    with tempfile.TemporaryDirectory(prefix="syccl_flow_inputs_") as tmp:
+        config_path, input_dir, output_dir, manifest_path, summary_path = (
+            EVALUATOR._write_flow_sim_inputs(raw, Path(tmp))
+        )
 
-    assert "GPU 16" in msg
-    assert "first reached at step 1" in msg
-    assert "strictly later step" in msg
-
-
-def test_nested_dst_list_error_explains_flat_list_requirement():
-    sketch = [
-        (0, 1, 0, 0, [1, 2, 3]),
-        (1, 1, 0, [0, 1, 2, 3], [[4, 5], [6, 7]]),
-    ]
-
-    try:
-        EVALUATOR._normalize_sketches([sketch])
-    except EVALUATOR.SketchValidationError as exc:
-        msg = str(exc)
-    else:
-        raise AssertionError("expected SketchValidationError")
-
-    assert "flat list" in msg
-    assert "nested" in msg
+        assert config_path.name == "candidate-config.json"
+        assert input_dir.name == "flow-sim-inputs"
+        assert output_dir.name == "flow-sim-runs"
+        assert manifest_path.name == "flow-sim-manifest.json"
+        assert summary_path.name == "flow-sim-summary.csv"
+        assert json.loads((input_dir / "candidate-000" / "candidate-sketch.json").read_text()) == raw
+        assert not (input_dir / "candidate-001").exists()
 
 
-def test_syccl_expand_size_mismatch_gets_specific_feedback():
-    metrics = EVALUATOR._error_result(
-        "SyCCL direct resim exited with code -11: "
-        "Failed to map node 0 to 1, size mismatch"
+def test_read_best_flow_sim_case_selects_lowest_time_and_requires_profile():
+    with tempfile.TemporaryDirectory(prefix="syccl_flow_outputs_") as tmp:
+        root = Path(tmp)
+        fast = root / "fast.json"
+        slow = root / "slow.json"
+        fast.write_text(json.dumps({
+            "name": "candidate-001",
+            "time_us": 7.5,
+            "bottleneck_profile": {"critical_flow_chain": {"latest_flow_id": 1}},
+        }), encoding="utf-8")
+        slow.write_text(json.dumps({
+            "name": "candidate-000",
+            "time_us": 12.0,
+            "bottleneck_profile": {"critical_flow_chain": {"latest_flow_id": 2}},
+        }), encoding="utf-8")
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps({
+            "cases": [
+                {"name": "candidate-000", "sketch_index": 0, "rust_output": str(slow)},
+                {"name": "candidate-001", "sketch_index": 0, "rust_output": str(fast)},
+            ]
+        }), encoding="utf-8")
+
+        selected = EVALUATOR._read_best_flow_sim_case(manifest)
+
+        assert selected.output["time_us"] == 7.5
+        assert selected.case["name"] == "candidate-001"
+        assert selected.case["sketch_index"] == 0
+
+
+def test_read_best_flow_sim_case_rejects_missing_bottleneck_profile():
+    with tempfile.TemporaryDirectory(prefix="syccl_flow_bad_output_") as tmp:
+        root = Path(tmp)
+        output = root / "bad.json"
+        output.write_text(json.dumps({"time_us": 1.0}), encoding="utf-8")
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps({
+            "cases": [{"name": "candidate-000", "rust_output": str(output)}]
+        }), encoding="utf-8")
+
+        try:
+            EVALUATOR._read_best_flow_sim_case(manifest)
+        except EVALUATOR.FlowSimOutputError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected FlowSimOutputError")
+
+        assert "bottleneck_profile" in message
+
+
+def test_success_metrics_scores_bytes_per_simulated_microsecond_and_prunes_fields():
+    output = {
+        "time_us": 7.5,
+        "bottleneck_profile": {"critical_flow_chain": {"latest_flow_id": 3}},
+    }
+    best = EVALUATOR.FlowSimCaseResult(
+        case={"name": "candidate-001", "sketch_index": 1},
+        output=output,
     )
 
-    assert metrics["failure_category"] == "syccl_expand_incompatible"
-    assert "symmetry expansion" in metrics["failure_feedback"]
-    assert "split" in metrics["failure_feedback"]
+    metrics = EVALUATOR._success_metrics(best=best)
+
+    assert metrics == {
+        "combined_score": EVALUATOR.COLL_BYTE / 7.5,
+        "validity": 1.0,
+        "bottleneck_profile": output["bottleneck_profile"],
+    }
+    assert "best_time_us" not in metrics
+    assert "flow_count" not in metrics
+    assert "finish_time_ns" not in metrics
 
 
-def test_syccl_expand_over_broad_layer_gets_specific_feedback():
+def test_flow_sim_sketch_errors_are_nonfatal():
     metrics = EVALUATOR._error_result(
-        "SyCCL direct resim exited with code -11: "
-        "Failed to expand sketch node #0 (step=0, layer=4, group=0) "
-        "from root GPU 0 to target GPU 1: mapped src/dst set sizes changed "
-        "from 1/31 to 1/1. The sketch likely assigned traffic to an "
-        "over-broad complete/top layer instead of the most specific valid "
-        "layer/group; for example, same-host sends such as 0->1 should use "
-        "the host layer, not the complete layer."
+        "flow-sim-rs batch-sketch exited with code 1: Error: unsupported layer 4; allowed layers are [1, 3]"
     )
 
-    assert metrics["failure_category"] == "syccl_expand_incompatible"
-    assert "proper layer" in metrics["failure_feedback"]
-    assert "host layer" in metrics["failure_feedback"]
+    assert metrics["failure_category"] == "flow_sim_sketch_error"
+    assert "unsupported layer 4" in metrics["failure_feedback"]
+    assert "simpletes_fatal" not in metrics
+
+
+def test_flow_sim_config_errors_are_fatal():
+    metrics = EVALUATOR._error_result("missing flow-sim-rs binary: /opt/flow-sim-rs")
+
+    assert metrics["failure_category"] == "flow_sim_config_error"
+    assert metrics["simpletes_fatal"] is True
+
+
+def test_flow_sim_output_errors_are_fatal():
+    metrics = EVALUATOR._error_result(
+        "flow-sim output /tmp/case.json missing required bottleneck_profile object"
+    )
+
+    assert metrics["failure_category"] == "flow_sim_output_error"
+    assert metrics["simpletes_fatal"] is True
+
+
+def test_run_flow_sim_batch_sketch_builds_batch_command():
+    with tempfile.TemporaryDirectory(prefix="syccl_flow_cmd_") as tmp:
+        root = Path(tmp)
+        config = root / "candidate-config.json"
+        input_dir = root / "flow-sim-inputs"
+        output_dir = root / "flow-sim-runs"
+        manifest = root / "flow-sim-manifest.json"
+        summary = root / "flow-sim-summary.csv"
+        input_dir.mkdir()
+        output_dir.mkdir()
+
+        with patch.object(EVALUATOR, "FLOW_SIM_BIN", Path("/opt/flow-sim-rs")):
+            with patch.object(EVALUATOR.subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="simulated 2 sketch cases",
+                )
+
+                returncode, _wall, log = EVALUATOR._run_flow_sim_batch_sketch(
+                    config,
+                    input_dir,
+                    output_dir,
+                    manifest,
+                    summary,
+                )
+
+        command = run.call_args.args[0]
+        assert returncode == 0
+        assert log == "simulated 2 sketch cases"
+        assert command == [
+            "/opt/flow-sim-rs",
+            "batch-sketch",
+            "--config",
+            str(config),
+            "--input-dir",
+            str(input_dir),
+            "--output-dir",
+            str(output_dir),
+            "--manifest",
+            str(manifest),
+            "--summary",
+            str(summary),
+        ]

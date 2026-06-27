@@ -178,7 +178,7 @@ class LLMClient:
         drop_params: bool = True,
         pool_size: int = 1,
         max_total_tokens: int | None = None,
-        reasoning_effort: str = "xhigh",
+        reasoning_effort: str = "medium",
     ):
         self.model = model
         self.temperature = temperature

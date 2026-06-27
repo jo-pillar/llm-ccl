@@ -1,2 +1,2 @@
-"""Two-agent SyCCL exploration workflow."""
+"""Small SyCCL helpers used by the SimpleTES SyCCL runner."""
 

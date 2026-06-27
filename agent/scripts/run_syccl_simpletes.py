@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import ipaddress
 import json
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, NamedTuple
+from string import Template
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 try:
@@ -18,12 +19,31 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
   tomllib = None
 
-
 AGENT_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = AGENT_ROOT.parent
+if str(AGENT_ROOT) not in sys.path:
+  sys.path.insert(0, str(AGENT_ROOT))
+
+class _CurrentStdoutHandler(logging.StreamHandler):
+  def emit(self, record: logging.LogRecord) -> None:
+    self.stream = sys.stdout
+    super().emit(record)
+
+
+if not logging.getLogger().handlers:
+  handler = _CurrentStdoutHandler()
+  handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+  logging.basicConfig(level=logging.INFO, handlers=[handler])
+LOGGER = logging.getLogger("run_syccl_simpletes")
+
+from syccl_agents.config_render import (
+    total_gpus,
+    write_syccl_config,
+)
+from syccl_agents.topodsl import TopoDSLSpec, load_topodsl
+
 DATASET_ROOT = AGENT_ROOT / "datasets" / "syccl" / "scheme1_direct_events"
 DEFAULT_ENV_TOML = AGENT_ROOT / "env.toml"
-DEFAULT_OUTPUT_ROOT = Path("/home/antl/mntdisk/syccl-llm-scheme1-direct-events")
+DEFAULT_OUTPUT_ROOT = Path("/home/antl/mntdisk/syccl-llm-scheme1-direct-events/simpletes")
 
 
 class RunSpec(NamedTuple):
@@ -32,24 +52,8 @@ class RunSpec(NamedTuple):
   cwd: Path
   instruction_path: Path
   output_path: Path
-
-
-def parse_size(value: str | int) -> int:
-  if isinstance(value, int):
-    return value
-  text = value.strip().lower()
-  suffixes = {
-      "k": 1024,
-      "kb": 1024,
-      "m": 1024 ** 2,
-      "mb": 1024 ** 2,
-      "g": 1024 ** 3,
-      "gb": 1024 ** 3,
-  }
-  for suffix, multiplier in suffixes.items():
-    if text.endswith(suffix):
-      return int(text[:-len(suffix)]) * multiplier
-  return int(text)
+  config_path: Path
+  init_program_path: Path
 
 
 def size_label(size: int) -> str:
@@ -57,33 +61,6 @@ def size_label(size: int) -> str:
     if size >= multiplier and size % multiplier == 0:
       return f"{size // multiplier}{suffix}"
   return f"{size}b"
-
-
-def load_manifest(path: str | Path) -> dict[str, Any]:
-  return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
-
-
-def select_entry(
-    manifest: dict[str, Any],
-    case_id: str,
-    collective: str,
-    coll_byte: int,
-) -> dict[str, Any]:
-  matches = [
-      entry for entry in manifest.get("entries", [])
-      if entry.get("case_id") == case_id
-      and entry.get("collective") == collective
-      and int(entry.get("coll_byte_B", -1)) == int(coll_byte)
-  ]
-  if not matches:
-    raise ValueError(
-        f"No manifest entry for case={case_id}, collective={collective}, coll_byte={coll_byte}"
-    )
-  if len(matches) > 1:
-    raise ValueError(
-        f"Multiple manifest entries for case={case_id}, collective={collective}, coll_byte={coll_byte}"
-    )
-  return matches[0]
 
 
 def load_env_toml(path: str | Path | None = DEFAULT_ENV_TOML) -> dict[str, str]:
@@ -98,6 +75,19 @@ def load_env_toml(path: str | Path | None = DEFAULT_ENV_TOML) -> dict[str, str]:
       for key, value in data.items()
       if key in {"model", "api_base", "api_key"} and value
   }
+
+
+def load_required_topodsl_from_env() -> TopoDSLSpec:
+  raw_path = os.environ.get("TOPODSL", "").strip()
+  if not raw_path:
+    raise SystemExit("fatal: TOPODSL environment variable must point to a TopoDSL file")
+  topo_path = Path(raw_path).expanduser()
+  if not topo_path.exists():
+    raise SystemExit(f"fatal: TOPODSL file does not exist: {topo_path}")
+  try:
+    return load_topodsl(topo_path)
+  except Exception as exc:
+    raise SystemExit(f"fatal: could not parse TOPODSL {topo_path}: {exc}") from exc
 
 
 def _is_private_api_host(host: str | None) -> bool:
@@ -124,86 +114,6 @@ def _append_no_proxy(env: dict[str, str], host: str) -> None:
     env[key] = ",".join(existing)
 
 
-def _load_config(path: str | Path) -> dict[str, Any]:
-  return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
-def _topology_name(config: dict[str, Any]) -> str:
-  switch_topos = [
-      layer.get("switch_topo")
-      for layer in config.get("topo", [])
-      if layer.get("type") == "switch"
-  ]
-  if "multirail" in switch_topos:
-    return "multirail"
-  if "pod" in switch_topos:
-    return "clos"
-  return "host"
-
-
-def _cross_layer_env(config: dict[str, Any]) -> tuple[str, str]:
-  switches = [
-      layer for layer in config.get("topo", [])
-      if layer.get("type") == "switch"
-  ]
-  if not switches:
-    return "1", "0"
-  topology = _topology_name(config)
-  if topology == "multirail":
-    layer = next(layer for layer in switches if layer.get("switch_topo") == "multirail")
-  else:
-    layer = switches[-1]
-  return str(layer["layer_id"]), "0"
-
-
-def _task_env(entry: dict[str, Any]) -> dict[str, str]:
-  config_path = Path(entry["config_path"]).expanduser().resolve()
-  config = _load_config(config_path)
-  hosts = config.get("hosts", {})
-  host_num = int(hosts.get("host_num", 1))
-  host_gpu_num = int(hosts.get("host_gpu_num", 1))
-  cross_layer, cross_group = _cross_layer_env(config)
-  return {
-      "SYCCL_BASE_CONFIG": str(config_path),
-      "SYCCL_TASK_HOST_NUM": str(host_num),
-      "SYCCL_TASK_HOST_GPU_NUM": str(host_gpu_num),
-      "SYCCL_TASK_NGPUS": str(host_num * host_gpu_num),
-      "SYCCL_TASK_TOPOLOGY": _topology_name(config),
-      "SYCCL_TASK_CROSS_LAYER": cross_layer,
-      "SYCCL_TASK_CROSS_GROUP": cross_group,
-  }
-
-
-def _load_evaluator_module(base_config: str):
-  evaluator_path = DATASET_ROOT / "evaluator.py"
-  spec = importlib.util.spec_from_file_location("syccl_scheme1_prompt_renderer", evaluator_path)
-  if spec is None or spec.loader is None:
-    raise RuntimeError(f"Could not load evaluator: {evaluator_path}")
-  module = importlib.util.module_from_spec(spec)
-  old = os.environ.get("SYCCL_BASE_CONFIG")
-  os.environ["SYCCL_BASE_CONFIG"] = base_config
-  try:
-    spec.loader.exec_module(module)
-  finally:
-    if old is None:
-      os.environ.pop("SYCCL_BASE_CONFIG", None)
-    else:
-      os.environ["SYCCL_BASE_CONFIG"] = old
-  return module
-
-
-def write_instruction(entry: dict[str, Any], output_path: Path) -> Path:
-  instruction_dir = output_path / "instructions"
-  instruction_dir.mkdir(parents=True, exist_ok=True)
-  instruction_path = instruction_dir / "syccl_instruction.txt"
-  module = _load_evaluator_module(str(Path(entry["config_path"]).expanduser().resolve()))
-  instruction_path.write_text(
-      module.render_instruction_for_config(entry["config_path"]),
-      encoding="utf-8",
-  )
-  return instruction_path
-
-
 def _restart_every_n(max_generations: int, num_chains: int, k: int, preferred: int = 125) -> int:
   if max_generations <= 0:
     return 1
@@ -219,49 +129,171 @@ def _restart_every_n(max_generations: int, num_chains: int, k: int, preferred: i
   return 1
 
 
+def _output_path(topo: TopoDSLSpec, root: str | Path, condition: str) -> Path:
+  params = topo.params
+  return (
+      Path(root).expanduser().resolve()
+      / topo.config_id
+      / params.family
+      / params.collective
+      / size_label(params.message_size)
+      / condition
+  )
+
+
+def _template_values(topo: TopoDSLSpec) -> dict[str, str]:
+  params = topo.params
+  gpu_num = total_gpus(params)
+  return {
+      "GPU_NUM": str(gpu_num),
+      "Collective": params.collective,
+      "COLLECTIVE": params.collective,
+      "TOPOLOGY": topo.prompt_source,
+      "TOPOLOGY_FAMILY": params.family,
+      "MESSAGE_SIZE": str(params.message_size),
+      "HOST_NUM": str(params.hosts),
+      "HOST_GPU_NUM": str(params.gpus_per_host),
+      "NIC_NUM": str(params.nics_per_host),
+      "TOPODSL": topo.prompt_source,
+  }
+
+
+def write_instruction(topo: TopoDSLSpec, template_path: str | Path, output_path: Path) -> Path:
+  source = Path(template_path).expanduser()
+  if not source.exists():
+    raise FileNotFoundError(f"instruction template not found: {source}")
+  instruction_dir = output_path / "instructions"
+  instruction_dir.mkdir(parents=True, exist_ok=True)
+  rendered = Template(source.read_text(encoding="utf-8")).safe_substitute(_template_values(topo))
+  instruction_path = instruction_dir / "syccl_instruction.txt"
+  instruction_path.write_text(rendered, encoding="utf-8")
+  return instruction_path
+
+
+def write_init_program(source_path: str | Path, output_path: str | Path, *, gpu_num: int) -> Path:
+  source = Path(source_path).expanduser().resolve()
+  if not source.exists():
+    raise FileNotFoundError(f"init program not found: {source}")
+  evolve_block = _extract_user_evolve_block(source.read_text(encoding="utf-8"), source)
+  output = Path(output_path)
+  output.parent.mkdir(parents=True, exist_ok=True)
+  output.write_text(
+      f'''"""Generated SyCCL initial program."""
+
+
+GPU_NUM = {int(gpu_num)}
+
+# EVOLVE-BLOCK-START
+{evolve_block.rstrip()}
+
+
+# EVOLVE-BLOCK-END
+
+
+def run_code():
+  return construct_sketches(GPU_NUM)
+''',
+      encoding="utf-8",
+  )
+  return output
+
+
+def _extract_user_evolve_block(source_text: str, source: Path) -> str:
+  lines = source_text.splitlines()
+  start_idx = -1
+  end_idx = -1
+  for idx, line in enumerate(lines):
+    if "EVOLVE-BLOCK-START" in line:
+      start_idx = idx
+    elif "EVOLVE-BLOCK-END" in line:
+      end_idx = idx
+      break
+  if start_idx >= 0 or end_idx >= 0:
+    if start_idx < 0 or end_idx < 0 or end_idx <= start_idx:
+      raise ValueError(f"invalid EVOLVE-BLOCK markers in init program: {source}")
+    block = "\n".join(lines[start_idx + 1:end_idx]).strip("\n")
+  else:
+    block = source_text.strip("\n")
+  if "def construct_sketches" not in block:
+    raise ValueError(f"init program evolve block must define construct_sketches(GPU_NUM): {source}")
+  return block
+
+
 def build_command(
-    entry: dict[str, Any],
+    topo: TopoDSLSpec,
     *,
-    condition: str,
+    init_program: str | Path,
+    instruction_template: str | Path,
     max_generations: int,
     output_root: str | Path | None = None,
     env_toml: str | Path | None = DEFAULT_ENV_TOML,
     skip_preflight: bool = False,
     save_llm_io: bool = False,
 ) -> RunSpec:
-  if condition not in {"full", "ablation"}:
-    raise ValueError("condition must be full or ablation")
 
-  config_path = Path(entry["config_path"]).expanduser().resolve()
-  if output_root:
-    root = Path(output_root).expanduser().resolve()
-  else:
-    root = (config_path.parents[3] / "simpletes") if len(config_path.parents) > 3 else (config_path.parent / "simpletes")
-  output_path = (
-      root
-      / entry["case_id"]
-      / entry["collective"]
-      / size_label(int(entry["coll_byte_B"]))
-      / condition
-  )
-  output_path.mkdir(parents=True, exist_ok=True)
-  instruction_path = write_instruction(entry, output_path)
+  root = output_root if output_root is not None else DEFAULT_OUTPUT_ROOT
+  output_path = _output_path(topo, root,"FULL")
+  generated_dir = output_path / "generated"
+  generated_dir.mkdir(parents=True, exist_ok=True)
+
+  params = topo.params
+  gpu_num = total_gpus(params)
+  config_path = write_syccl_config(params, generated_dir / "flow-sim-config.json")
+  instruction_path = write_instruction(topo, instruction_template, output_path)
+  init_program_path = write_init_program(init_program, generated_dir / "init_program.py", gpu_num=gpu_num)
 
   model_config = load_env_toml(env_toml)
   env = os.environ.copy()
-  env.update(_task_env(entry))
+  for key in list(env):
+    if key.startswith("SYCCL_TASK_"):
+      env.pop(key, None)
+  env["SYCCL_BASE_CONFIG"] = str(config_path)
   env["SYCCL_EVAL_ARTIFACT_DIR"] = str(output_path / "eval_artifacts")
   api_host = urlparse(model_config.get("api_base", "")).hostname
   if _is_private_api_host(api_host):
     _append_no_proxy(env, api_host)
+# 
+# PYTHONPATH=/home/antl/wzd/syccl/agent \
+# PYTHONUNBUFFERED=1 \
+# UV_CACHE_DIR=/tmp/uv-cache \
+# MPLCONFIGDIR=/tmp/matplotlib \
+# SYCCL_BASE_CONFIG=/home/antl/wzd/syccl/config/a100-8gpu-4nic-clos-ag-4k.json \
+# SYCCL_TASK_HOST_NUM=4 \
+# SYCCL_TASK_HOST_GPU_NUM=8 \
+# SYCCL_TASK_NGPUS=32 \
+# SYCCL_TASK_TOPOLOGY=clos \
+# SYCCL_TASK_CROSS_LAYER=4 \
+# SYCCL_TASK_CROSS_GROUP=0 \
+# SYCCL_EVAL_ARTIFACT_DIR=/home/antl/wzd/syccl/agent/debug_runs/syccl_scheme1_llm_elite/eval_artifacts \
+# FLOW_SIM_BIN=/home/antl/wzd/llm-ccl/Flow-Simulator/flow-sim-rs/target/release/flow-sim-rs \
+# python main.py \
+# --init-program init_program.py \
+# --evaluator evaluator.py \
+# --instruction syccl_sketch_4host_clos.txt \
+# --model deepseek/deepseek-v4-flash \
+# --api-base https://api.deepseek.com \
+# --max-generations 3 \
+# --output-path /home/antl/wzd/syccl/agent/debug_runs/syccl_scheme1_llm_elite/checkpoints \
+# --init-eval-repeats 1 \
+# --eval-concurrency 1 \
+# --gen-concurrency 1 \
+# --selector llm_elite \
+# --num-chains 1 \
+# --k-candidates 1 \
+# --restart-every-n 1 \
+# --llm-policy-pool-size 3 \
+# --elite-selection-strategy all \
+# --save-llm-io \
+# --skip-preflight
 
+# 如果你要的是第二个“dry startup”配置，或者第三个 pytest 配置，我也可以继续帮你还原成对应的终端命令。
   command = [
       "uv",
       "run",
       "python",
       "main.py",
       "--init-program",
-      str(DATASET_ROOT / "init_program.py"),
+      str(init_program_path),
       "--evaluator",
       str(DATASET_ROOT / "evaluator.py"),
       "--instruction",
@@ -272,8 +304,16 @@ def build_command(
       str(output_path / "checkpoints"),
       "--init-eval-repeats",
       "1",
+      "--num-chains",
+      "1",
+      "--k-candidates",
+      "1",
       "--selector",
-      "balance",
+      "llm_elite",
+      "--llm-policy-pool-size",
+      "100",
+      "--elite-selection-strategy",
+      "all",   
   ]
   if skip_preflight:
     command.append("--skip-preflight")
@@ -284,31 +324,6 @@ def build_command(
     if key in model_config:
       command.extend([flag, model_config[key]])
 
-  if condition == "full":
-    num_chains, k = 4, 4
-    command.extend([
-        "--num-chains",
-        str(num_chains),
-        "--k-candidates",
-        str(k),
-        "--restart-every-n",
-        str(_restart_every_n(max_generations, num_chains, k)),
-        "--include-construction",
-    ])
-  else:
-    num_chains, k = 1, 1
-    command.extend([
-        "--num-inspirations",
-        "0",
-        "--num-chains",
-        str(num_chains),
-        "--k-candidates",
-        str(k),
-        "--restart-every-n",
-        str(_restart_every_n(max_generations, num_chains, k)),
-        "--disable-reflection",
-        "--disable-failure-patterns",
-    ])
 
   return RunSpec(
       command=command,
@@ -316,6 +331,8 @@ def build_command(
       cwd=AGENT_ROOT,
       instruction_path=instruction_path,
       output_path=output_path,
+      config_path=config_path,
+      init_program_path=init_program_path,
   )
 
 
@@ -327,45 +344,44 @@ def _redacted_env(env: dict[str, str]) -> dict[str, str]:
   }
 
 
-def _parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(description="Run SimpleTES on a SyCCL manifest entry")
-  parser.add_argument("--manifest", required=True)
-  parser.add_argument("--case", required=True)
-  parser.add_argument("--collective", default="allgather", choices=["allgather", "alltoall"])
-  parser.add_argument("--coll-byte", required=True)
-  parser.add_argument("--condition", required=True, choices=["full", "ablation"])
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+  parser = argparse.ArgumentParser(description="Run SimpleTES on a SyCCL TopoDSL task")
+  parser.add_argument("--init-program", required=True, type=Path)
+  parser.add_argument("--instruction", required=True, type=Path)
+
   parser.add_argument("--max-generations", type=int, default=10000)
-  parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT / "simpletes"))
+  parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
   parser.add_argument("--env-toml", default=str(DEFAULT_ENV_TOML))
   parser.add_argument("--dry-run", action="store_true")
   parser.add_argument("--skip-preflight", action="store_true")
   parser.add_argument("--save-llm-io", "--save_llm_io", dest="save_llm_io", action="store_true")
-  return parser.parse_args()
+  return parser.parse_args(argv)
 
 
-def main() -> int:
-  args = _parse_args()
-  manifest = load_manifest(args.manifest)
-  entry = select_entry(
-      manifest,
-      case_id=args.case,
-      collective=args.collective,
-      coll_byte=parse_size(args.coll_byte),
-  )
+def main(argv: list[str] | None = None) -> int:
+  args = _parse_args(argv)
+  topo = load_required_topodsl_from_env()
   spec = build_command(
-      entry,
-      condition=args.condition,
+      topo,
+      init_program=args.init_program,
+      instruction_template=args.instruction,
       max_generations=args.max_generations,
       output_root=args.output_root,
       env_toml=args.env_toml,
       skip_preflight=args.skip_preflight,
       save_llm_io=args.save_llm_io,
   )
+  
+  LOGGER.info("SimpleTES command: %s", " ".join(spec.command))
+  exit(0)
   if args.dry_run:
     print("Command:")
     print(" ".join(spec.command))
     print("Environment:")
     print(json.dumps(_redacted_env(spec.env), indent=2))
+    print(f"TopoDSL: {topo.path}")
+    print(f"Config: {spec.config_path}")
+    print(f"Init program: {spec.init_program_path}")
     print(f"Instruction: {spec.instruction_path}")
     print(f"Output: {spec.output_path}")
     return 0
@@ -374,4 +390,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-  raise SystemExit(main())
+  raise SystemExit(main(sys.argv[1:]))

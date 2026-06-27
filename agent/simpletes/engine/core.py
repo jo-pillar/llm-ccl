@@ -39,7 +39,7 @@ from simpletes.config import (
 from simpletes.engine.runtime import LocalRuntime, RuntimeBase
 from simpletes.engine.checkpoint import CheckpointManager
 from simpletes.engine.scheduler import SchedulerMixin
-from simpletes.evaluator import EvaluationOutcome, EvaluatorWorker
+from simpletes.evaluator import EvaluationOutcome, EvaluatorWorker, FatalEvaluatorError
 from simpletes.node import (
     EvolveBlockContext,
     Node,
@@ -450,6 +450,8 @@ class SimpleTESEngine(SchedulerMixin):
                 metrics=metrics,
                 captured_construction_payload=outcome.captured_construction_payload,
             )
+        except FatalEvaluatorError:
+            raise
         except Exception as e:
             metrics = {"error": str(e), "combined_score": -float("inf")}
             truncate_error_in_metrics(metrics, max_chars=DEFAULT_METRICS_ERROR_MAX_CHARS)
@@ -847,6 +849,13 @@ class SimpleTESEngine(SchedulerMixin):
                             assert node.gen_id is not None, "pending node missing gen_id"
                             completion = self.selector.on_generation_failed(node.gen_id)
                             await self._handle_pending_finalize(completion)
+                    raise
+                except FatalEvaluatorError as e:
+                    self.eval_queue.task_done()
+                    self._stop_event.set()
+                    self._progress_event.set()
+                    rich_print(self._log("✗", f"[bold red]{e}[/bold red]"))
+                    current_node_id = None
                     raise
                 except Exception as e:
                     self.eval_queue.task_done()
