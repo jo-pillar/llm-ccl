@@ -951,6 +951,49 @@ def construct_sketches():
             self.assertIn("Proposal LLM output:", llm.prompts[1])
             self.assertIn(bad_completion, llm.prompts[1])
 
+    def test_flow_sim_rejected_proposal_is_recorded_as_invalid_feedback(self) -> None:
+        with self._tmpdir() as tmp_path:
+            topo_path = tmp_path / "clos_2host.py"
+            _write_python_topodsl(topo_path)
+            flow_sim_error = (
+                "flow-sim-rs simulate-sketch failed with 1: "
+                "Error: transmission 64.step must be in [0, 31]"
+            )
+            calls = 0
+
+            def flow_sim_fn(**_: object) -> dict[str, object]:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return {
+                        "time_us": 10.0,
+                        "flow_count": 12,
+                        "bottleneck_profile": _fake_bottleneck_profile(),
+                    }
+                raise RuntimeError(flow_sim_error)
+
+            engine, llm = _build_engine(
+                tmp_path,
+                topo_path=topo_path,
+                rounds=1,
+                completions=[_fake_sketch_evolve_block(), _record_completion(0)],
+                flow_sim_fn=flow_sim_fn,
+            )
+
+            _run_engine_without_slow_finalization(engine)
+
+            artifacts_dir = Path(engine.checkpoint_dir) / "syccl_two_agent"
+            round_record = json.loads((artifacts_dir / "rounds.jsonl").read_text().splitlines()[0])
+            self.assertIn("flow-sim-rs simulate-sketch failed", round_record["validity_status"])
+            self.assertEqual(round_record["bottleneck_profile"]["status"], "invalid")
+            self.assertIn("transmission 64.step", round_record["bottleneck_profile"]["diagnosis"])
+            self.assertTrue(math.isinf(round_record["completion_time"]))
+            self.assertLess(round_record["combined_score"], -1_000_000_000.0)
+            record_prompt = llm.prompts[1]
+            self.assertIn("flow-sim-rs simulate-sketch failed", record_prompt)
+            self.assertIn("transmission 64.step must be in [0, 31]", record_prompt)
+            self.assertIn('"validity_status": "invalid:', record_prompt)
+
     def test_record_agent_prompt_requests_json_record_and_applies_repaired_output(self) -> None:
         with self._tmpdir() as tmp_path:
             topo_path = tmp_path / "clos_2host.py"

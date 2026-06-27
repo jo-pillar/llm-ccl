@@ -8,8 +8,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-
-_LOADED_TOPOLOGY_INSTANCES: list["BaseTopology"] = []
+from syccl_agents.base_topology import (
+    BaseTopology,
+    CollectiveType,
+    LayerSpec,
+    LinkSpec,
+    Node,
+    NodeType,
+)
 
 
 @dataclass(frozen=True)
@@ -42,52 +48,6 @@ class TopoDSLSpec:
     config_id: str
 
 
-@dataclass(frozen=True)
-class LinkSpec:
-    bandwidth: Any
-    latency: Any
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-class BaseTopology:
-    def __init__(self, params: dict[str, Any] | None = None, link_specs: dict[str, LinkSpec] | None = None) -> None:
-        self.params = dict(params or {})
-        self.link_specs = dict(link_specs or {})
-        self.connections: list[dict[str, Any]] = []
-        self.build_topology()
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        original_init = cls.__init__
-
-        def wrapped_init(self, *args: Any, **kwargs: Any) -> None:
-            original_init(self, *args, **kwargs)
-            if not hasattr(self, "params"):
-                self.params = {}
-            if not hasattr(self, "link_specs"):
-                self.link_specs = {}
-            if not hasattr(self, "connections"):
-                self.connections = []
-            self.build_topology()
-            _LOADED_TOPOLOGY_INSTANCES.append(self)
-
-        cls.__init__ = wrapped_init
-
-    def connect(self, src_node: str, dst_node: str, link_spec: LinkSpec) -> None:
-        spec = link_spec.to_dict()
-        self.connections.append({
-            "source": src_node,
-            "destination": dst_node,
-            "bandwidth": spec["bandwidth"],
-            "latency": spec["latency"],
-        })
-
-    def build_topology(self) -> None:
-        raise NotImplementedError
-
-
 def load_topodsl(
     path: str | Path,
     *,
@@ -96,6 +56,7 @@ def load_topodsl(
 ) -> TopoDSLSpec:
     topo_path = Path(path).expanduser().resolve()
     source = topo_path.read_text(encoding="utf-8")
+    prompt_source = _prompt_source(source) if topo_path.suffix == ".py" else source
     data = (
         _load_python_topology(topo_path, collective=collective, message_size=message_size)
         if topo_path.suffix == ".py"
@@ -108,10 +69,20 @@ def load_topodsl(
     params = _normalize_params(data)
     return TopoDSLSpec(
         path=topo_path,
-        prompt_source=source,
+        prompt_source=prompt_source,
         params=params,
         config_id=_config_id(params),
     )
+
+
+def _prompt_source(source: str) -> str:
+    begin = "###TopoBegin"
+    end = "###TopoEND"
+    begin_index = source.find(begin)
+    end_index = source.find(end)
+    if begin_index < 0 or end_index < 0 or end_index <= begin_index:
+        return source
+    return source[begin_index + len(begin):end_index].strip()
 
 
 def _load_python_topology(
@@ -120,23 +91,21 @@ def _load_python_topology(
     collective: str | None,
     message_size: int | None,
 ) -> dict[str, Any]:
-    _LOADED_TOPOLOGY_INSTANCES.clear()
-    try:
-        namespace = runpy.run_path(
-            str(path),
-            init_globals={
-                "BaseTopology": BaseTopology,
-                "LinkSpec": LinkSpec,
-            },
-        )
-    finally:
-        instances = list(_LOADED_TOPOLOGY_INSTANCES)
-        _LOADED_TOPOLOGY_INSTANCES.clear()
+    namespace = runpy.run_path(
+        str(path),
+        init_globals={
+            "BaseTopology": BaseTopology,
+            "LinkSpec": LinkSpec,
+            "LayerSpec": LayerSpec,
+            "Node": Node,
+            "NodeType": NodeType,
+            "CollectiveType": CollectiveType,
+        },
+    )
     topology = namespace.get("topology")
     if not callable(topology):
         return _extract_instantiated_topology(
             namespace,
-            instances,
             collective=collective,
             message_size=message_size,
         )
@@ -148,12 +117,11 @@ def _load_python_topology(
 
 def _extract_instantiated_topology(
     namespace: dict[str, Any],
-    instances: list[BaseTopology],
     *,
     collective: str | None,
     message_size: int | None,
 ) -> dict[str, Any]:
-    candidates = list(instances) or [
+    candidates = [
         value
         for value in namespace.values()
         if isinstance(value, BaseTopology) and value.__class__ is not BaseTopology
@@ -184,6 +152,14 @@ def _clos_object_to_data(
     collective: str | None,
     message_size: int | None,
 ) -> dict[str, Any]:
+    if hasattr(topology, "layer_spec_0"):
+        return _clos_layer_spec_object_to_data(
+            topology,
+            collective=collective,
+            message_size=message_size,
+        )
+    else:
+        raise ValueError("ClosTopology must define layer_spec_0, layer_spec_1, layer_spec_2, and layer_spec_3")
     gpu_num = _positive_attr(topology, "gpu_num")
     host_num = _positive_attr(topology, "host_num")
     leaf_num = _positive_attr(topology, "leaf_num")
@@ -208,12 +184,60 @@ def _clos_object_to_data(
     }
 
 
+def _clos_layer_spec_object_to_data(
+    topology: BaseTopology,
+    *,
+    collective: str | None,
+    message_size: int | None,
+) -> dict[str, Any]:
+    gpu_num = _positive_attr(topology, "gpu_num")
+    host_local = _required_layer_spec(topology, 0)
+    gpu_host = _required_layer_spec(topology, 1)
+    host_leaf = _required_layer_spec(topology, 2)
+    leaf_spine = _required_layer_spec(topology, 3)
+
+    host_num = _positive_layer_value(host_local, "group_num")
+    gpus_per_host = _positive_layer_value(host_local, "node_num")
+    nics_per_host = _positive_layer_value(gpu_host, "node_num")
+    leaf_switches = _positive_layer_value(host_leaf, "group_num")
+    spine_switches = _positive_layer_value(leaf_spine, "group_num")
+    if gpu_num != host_num * gpus_per_host:
+        raise ValueError("gpu_num must match layer_spec_0.group_num * layer_spec_0.node_num")
+
+    return {
+        "family": "clos",
+        "hosts": host_num,
+        "gpus_per_host": gpus_per_host,
+        "nics_per_host": nics_per_host,
+        "leaf_switches": leaf_switches,
+        "spine_switches": spine_switches,
+        "message_size": _message_size_from_object(topology, fallback=message_size),
+        "collective": _collective_from_object(topology, fallback=collective),
+        "host_bw_mbpus": _bandwidth_to_mbpus(host_local.link_spec.bandwidth),
+        "host_lat_us": _latency_to_us(host_local.link_spec.latency),
+        "nic_bw_mbpus": _bandwidth_to_mbpus(gpu_host.link_spec.bandwidth),
+        "nic_lat_us": _latency_to_us(gpu_host.link_spec.latency),
+        "net_bw_mbpus": _bandwidth_to_mbpus(host_leaf.link_spec.bandwidth),
+        "net_lat_us": _latency_to_us(host_leaf.link_spec.latency),
+        "spine_bw_mbpus": _bandwidth_to_mbpus(leaf_spine.link_spec.bandwidth),
+        "spine_lat_us": _latency_to_us(leaf_spine.link_spec.latency),
+    }
+
+
 def _multirail_object_to_data(
     topology: BaseTopology,
     *,
     collective: str | None,
     message_size: int | None,
 ) -> dict[str, Any]:
+    if hasattr(topology, "layer_spec_0"):
+        return _multirail_layer_spec_object_to_data(
+            topology,
+            collective=collective,
+            message_size=message_size,
+        )
+    else:
+        raise ValueError("MultiRailTopology must define layer_spec_0, layer_spec_1, and layer_spec_3")
     gpu_num = _positive_attr(topology, "gpu_num")
     host_num = _positive_attr(topology, "host_num")
     rails = int(getattr(topology, "rail_num", getattr(topology, "rails", 1)))
@@ -227,6 +251,41 @@ def _multirail_object_to_data(
         "rails": rails,
         "message_size": _message_size_from_object(topology, fallback=message_size),
         "collective": _collective_from_object(topology, fallback=collective),
+    }
+
+
+def _multirail_layer_spec_object_to_data(
+    topology: BaseTopology,
+    *,
+    collective: str | None,
+    message_size: int | None,
+) -> dict[str, Any]:
+    gpu_num = _positive_attr(topology, "gpu_num")
+    host_local = _required_layer_spec(topology, 0)
+    gpu_nic = _required_layer_spec(topology, 1)
+    rail = _required_layer_spec(topology, 3)
+
+    host_num = _positive_layer_value(host_local, "group_num")
+    gpus_per_host = _positive_layer_value(host_local, "node_num")
+    nics_per_host = _positive_layer_value(gpu_nic, "node_num")
+    rails = _positive_layer_value(rail, "group_num")
+    if gpu_num != host_num * gpus_per_host:
+        raise ValueError("gpu_num must match layer_spec_0.group_num * layer_spec_0.node_num")
+
+    return {
+        "family": "multirail",
+        "hosts": host_num,
+        "gpus_per_host": gpus_per_host,
+        "nics_per_host": nics_per_host,
+        "rails": rails,
+        "message_size": _message_size_from_object(topology, fallback=message_size),
+        "collective": _collective_from_object(topology, fallback=collective),
+        "host_bw_mbpus": _bandwidth_to_mbpus(host_local.link_spec.bandwidth),
+        "host_lat_us": _latency_to_us(host_local.link_spec.latency),
+        "nic_bw_mbpus": _bandwidth_to_mbpus(gpu_nic.link_spec.bandwidth),
+        "nic_lat_us": _latency_to_us(gpu_nic.link_spec.latency),
+        "net_bw_mbpus": _bandwidth_to_mbpus(rail.link_spec.bandwidth),
+        "net_lat_us": _latency_to_us(rail.link_spec.latency),
     }
 
 
@@ -319,6 +378,20 @@ def _positive_attr(topology: BaseTopology, name: str) -> int:
     return value
 
 
+def _required_layer_spec(topology: BaseTopology, layer_id: int) -> LayerSpec:
+    value = getattr(topology, f"layer_spec_{layer_id}", None)
+    if value is None:
+        raise ValueError(f"layer_spec_{layer_id} must be provided")
+    return value
+
+
+def _positive_layer_value(layer_spec: LayerSpec, name: str) -> int:
+    value = int(getattr(layer_spec, name))
+    if value <= 0:
+        raise ValueError(f"layer_spec_{layer_spec.layer_id}.{name} must be positive")
+    return value
+
+
 def _message_size_from_object(topology: BaseTopology, *, fallback: int | None = None) -> int:
     for name in ("message_size", "coll_bytes", "coll_byte"):
         if hasattr(topology, name):
@@ -330,7 +403,8 @@ def _message_size_from_object(topology: BaseTopology, *, fallback: int | None = 
 
 def _collective_from_object(topology: BaseTopology, *, fallback: str | None = None) -> str:
     if hasattr(topology, "collective"):
-        return str(getattr(topology, "collective")).lower()
+        value = getattr(topology, "collective")
+        return str(getattr(value, "value", value)).lower()
     if fallback is not None:
         return str(fallback).lower()
     return "allgather"

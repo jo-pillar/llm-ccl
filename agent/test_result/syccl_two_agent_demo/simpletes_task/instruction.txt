@@ -1,0 +1,81 @@
+Optimize SyCCL direct-event sketch generation for a Custom $Collective target.
+
+You are evolving Python code that returns candidate single-root broadcast sketches
+in a compact DSL. The target collective is $Collective, but you do not write a full
+$Collective schedule directly. Instead, your sketch describes how the chunk initially
+owned by GPU 0 should be broadcast to every other GPU. The evaluator expands that
+single-root broadcast tree into one analogous tree per source chunk/root GPU using
+topology-preserving rotations, then simulates the resulting full GPU-to-GPU
+$Collective event schedule. This means a good compact tree must be fast for root 0
+and, more importantly, should create low contention after the same pattern is
+rotated across all $GPU_NUM roots.
+
+The evaluator validates your DSL, converts valid single root sketches into COMPLETE $Collective schedules by applying the same pattern for each root GPU, then
+expands them into $Collective direct events, and runs a simulator. You only need to
+return candidate sketches; do not call the simulator yourself.
+
+Optimization objective:
+
+    combined_score = -best_time_us
+
+Higher `combined_score` is better. Because it is the negative of simulated time,
+the real objective is to minimize `best_time_us`, the best simulated $Collective
+completion time in microseconds among the returned candidate sketches.
+
+topo_dsl:
+```python
+
+```
+
+Required return format:
+- Return exactly one Python code block.
+- The code block must include `# EVOLVE-BLOCK-START` and `# EVOLVE-BLOCK-END`.
+- Implement `construct_sketches()` between the EVOLVE-BLOCK markers.
+- Do not return a bare JSON list, prose-only answer, or code without the markers.
+- Return at most ONE sketches.
+- A sketch is a list of compact transmissions.
+- Preferred compact transmission form:
+
+```python
+(step, layer, group, srcs, dsts)
+```
+
+- `srcs` and `dsts` may each be a single GPU id or a list of GPU ids.
+- If `srcs` contains multiple GPUs, all listed sources must already have the chunk
+  before this step. During direct-event expansion, destinations in that
+  transmission are assigned across the listed sources in order, which can express
+  parallel fanout from several relays inside one layer/group.
+- Dict form is also accepted:
+
+```python
+{"step": 0, "layer": 1, "group": 0, "srcs": [0], "dsts": [1, 2, 3]}
+```
+
+Validity constraints:
+- Use only layers 1, 3, and 4.
+- A transmission's srcs and dsts must all be inside the specified layer/group.
+- GPU ids must be integers in 0..$GPU_NUM-1.
+- GPU 0 starts with the root chunk.
+- Every GPU 1..$GPU_NUM-1 must be reached exactly once; GPU 0 must not appear as a dst.
+- A GPU may be used as a source only after it has received the chunk in an earlier step, except GPU 0.
+- Dependent steps must be strictly increasing. Same-step forwarding through a newly reached GPU is invalid.
+- No transmission may have duplicate dst ids, and no sketch may deliver to the same dst twice.
+
+
+Design guidance:
+- Think in two stages: first design an efficient broadcast tree for chunk 0, then reason about what happens when the same tree is rotated to all $GPU_NUM chunks for $Collective. 
+- Try different relay GPUs, fanout timing, and dependency depths.
+- Consider using multiple already-reached relays as `srcs` for a later fanout 
+- ONLY return ONE sketch one time.
+
+Evaluator metrics:
+- `combined_score`: the only score to maximize; equals `-best_time_us`.
+- `validity`: 1.0 for a valid sketch that simulates successfully, 0.0 otherwise.
+- `best_time_us`: primary performance value to minimize; simulated $Collective time.
+- `bottleneck_profile`: sketch-level diagnostic information. Use `top_transmission_bottlenecks`, `critical_transmission`, `critical_chain`, and `stage_pressure` to identify which `(step, layer, group, srcs, dsts)` transmissions should change. Do not reason in terms of internal network link ids.
+
+HISTORICAL RECORD:The following is a historical record of the sketches returned in previous trials. Use it to avoid repeating the same patterns and to inspire new ones. The evaluator does not consider these sketches when scoring the current trial, but you can use them as a reference for what has already been tried.
+Trail 0:
+- transmissions strategy:
+- compact dsl:
+- profile data:

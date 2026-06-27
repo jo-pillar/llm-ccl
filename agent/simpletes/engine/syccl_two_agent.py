@@ -205,6 +205,7 @@ class SycclTwoAgentRuntime(RuntimeBase):
                 init_program_reference=init_program_reference,
                 evolve_context=engine._evolve_context,
             )
+            print(format_log(f"Round {round_id} proposal prompt:\n{prompt}"))
             llm_result = await _call_llm(
                 proposal_llm,
                 prompt,
@@ -641,24 +642,56 @@ class SycclTwoAgentRuntime(RuntimeBase):
             return CandidateEvaluation(metrics=metrics, candidate=candidate, candidate_code=candidate_code)
         except (MissingBottleneckProfileError, FlowSimOutputError, OSError):
             raise
+        except RuntimeError as exc:
+            return CandidateEvaluation(
+                metrics=self._invalid_candidate_metrics(
+                    error=f"flow-sim rejected candidate: {exc}",
+                    raw_output=raw_output,
+                    code_extract_reason=code_extract_reason,
+                    candidate_code_path=candidate_code_path,
+                    artifacts_dir=artifacts_dir,
+                ),
+                candidate=candidate,
+                candidate_code=candidate_code,
+            )
         except CandidateInvalidError as exc:
-            metrics = {
-                "combined_score": _invalid_score(),
-                "error": str(exc),
-                "validity_status": f"invalid: {exc}",
-                "completion_time": FAILURE_COMPLETION_TIME,
-                "algorithm_bandwidth": None,
-                "expanded_events": 0,
-                "bottleneck_profile": _invalid_bottleneck_profile(str(exc)),
-                "best_so_far": False,
-                "record_summary": self.record_agent.summary,
-                "direction_hint": self.record_agent.direction_hint,
-                "enumeration_status": "skipped",
-                "proposal_output": raw_output,
-                "code_extract_reason": code_extract_reason,
-                "candidate_code_path": _artifact_relpath(candidate_code_path, artifacts_dir),
-            }
-            return CandidateEvaluation(metrics=metrics, candidate=candidate, candidate_code=candidate_code)
+            return CandidateEvaluation(
+                metrics=self._invalid_candidate_metrics(
+                    error=str(exc),
+                    raw_output=raw_output,
+                    code_extract_reason=code_extract_reason,
+                    candidate_code_path=candidate_code_path,
+                    artifacts_dir=artifacts_dir,
+                ),
+                candidate=candidate,
+                candidate_code=candidate_code,
+            )
+
+    def _invalid_candidate_metrics(
+        self,
+        *,
+        error: str,
+        raw_output: str,
+        code_extract_reason: str | None,
+        candidate_code_path: Path | None,
+        artifacts_dir: Path,
+    ) -> dict[str, Any]:
+        return {
+            "combined_score": _invalid_score(),
+            "error": error,
+            "validity_status": f"invalid: {error}",
+            "completion_time": FAILURE_COMPLETION_TIME,
+            "algorithm_bandwidth": None,
+            "expanded_events": 0,
+            "bottleneck_profile": _invalid_bottleneck_profile(error),
+            "best_so_far": False,
+            "record_summary": self.record_agent.summary,
+            "direction_hint": self.record_agent.direction_hint,
+            "enumeration_status": "skipped",
+            "proposal_output": raw_output,
+            "code_extract_reason": code_extract_reason,
+            "candidate_code_path": _artifact_relpath(candidate_code_path, artifacts_dir),
+        }
 
     def _write_round_record(
         self,
