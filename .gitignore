@@ -1,3 +1,4 @@
-result/*
+**/result/*
 *.pyc
 __pycache__/
+**/target/

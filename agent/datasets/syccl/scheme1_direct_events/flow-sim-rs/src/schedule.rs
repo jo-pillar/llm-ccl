@@ -1,0 +1,291 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{BufReader, Read};
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawTranslated {
+    coll_name: Option<String>,
+    ngpus: usize,
+    chunk_size_byte: Option<u64>,
+    algorithms: Vec<RawAlgorithm>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawAlgorithm {
+    final_schedule: RawFinalSchedule,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawFinalSchedule {
+    #[serde(rename = "Time")]
+    time: Option<f64>,
+    #[serde(rename = "Schedule")]
+    schedule: RawSchedule,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawSchedule {
+    #[serde(rename = "Events")]
+    events: Vec<RawEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawEvent {
+    src_chunk: String,
+    sends: Vec<RawSend>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawSend {
+    src_gpu: usize,
+    dst_gpu: usize,
+    epoch: u64,
+    layer_used: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendEvent {
+    pub src_chunk: usize,
+    pub chunk_index: usize,
+    pub src_gpu: usize,
+    pub dst_gpu: usize,
+    pub epoch: u64,
+    pub layer_used: Option<i64>,
+    pub order: usize,
+    pub sketch_source: Option<SketchTransmissionSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SketchTransmissionSource {
+    pub transmission_index: usize,
+    pub step: u64,
+    pub layer: i64,
+    pub group: usize,
+    pub srcs: Vec<usize>,
+    pub dsts: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranslatedSchedule {
+    pub coll_name: Option<String>,
+    pub ngpus: usize,
+    pub chunk_size_byte: Option<u64>,
+    pub sends: Vec<SendEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlgorithmSchedule {
+    pub algorithm_index: usize,
+    pub syccl_time_us: Option<f64>,
+    pub schedule: TranslatedSchedule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flow {
+    pub id: usize,
+    pub channel_id: usize,
+    pub src_chunk: usize,
+    pub chunk_index: usize,
+    pub src: usize,
+    pub dst: usize,
+    pub epoch: u64,
+    pub order: usize,
+    pub size_bytes: u64,
+    pub recv_parents: Vec<usize>,
+    pub send_parents: Vec<usize>,
+    pub children: Vec<usize>,
+    pub sketch_source: Option<SketchTransmissionSource>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowGraph {
+    pub flows: Vec<Flow>,
+    pub channel_count: usize,
+}
+
+pub fn parse_translated_schedule<R: Read>(reader: R) -> Result<TranslatedSchedule> {
+    let raw = parse_raw_translated(reader)?;
+    parse_algorithm_schedule(&raw, 0).map(|algorithm| algorithm.schedule)
+}
+
+pub fn parse_all_translated_schedules<R: Read>(reader: R) -> Result<Vec<AlgorithmSchedule>> {
+    let raw = parse_raw_translated(reader)?;
+    raw.algorithms
+        .iter()
+        .enumerate()
+        .map(|(algorithm_index, _)| parse_algorithm_schedule(&raw, algorithm_index))
+        .collect()
+}
+
+fn parse_raw_translated<R: Read>(reader: R) -> Result<RawTranslated> {
+    let raw: RawTranslated = serde_json::from_reader(BufReader::new(reader))
+        .context("failed to parse translated schedule JSON")?;
+    if raw.algorithms.is_empty() {
+        return Err(anyhow!("translated schedule has no algorithms"));
+    }
+    if raw
+        .coll_name
+        .as_deref()
+        .is_some_and(|name| name != "allgather" && name != "alltoall")
+    {
+        return Err(anyhow!(
+            "unsupported translated collective {:?}",
+            raw.coll_name
+        ));
+    }
+
+    Ok(raw)
+}
+
+fn parse_algorithm_schedule(
+    raw: &RawTranslated,
+    algorithm_index: usize,
+) -> Result<AlgorithmSchedule> {
+    let algorithm = raw
+        .algorithms
+        .get(algorithm_index)
+        .ok_or_else(|| anyhow!("algorithm_index {} is out of range", algorithm_index))?;
+    let sends = parse_algorithm_sends(&algorithm.final_schedule.schedule.events)
+        .with_context(|| format!("failed to parse algorithm {}", algorithm_index))?;
+    if sends.is_empty() {
+        return Err(anyhow!(
+            "translated schedule algorithm {} contains no sends",
+            algorithm_index
+        ));
+    }
+    Ok(AlgorithmSchedule {
+        algorithm_index,
+        syccl_time_us: algorithm.final_schedule.time,
+        schedule: TranslatedSchedule {
+            coll_name: raw.coll_name.clone(),
+            ngpus: raw.ngpus,
+            chunk_size_byte: raw.chunk_size_byte,
+            sends,
+        },
+    })
+}
+
+fn parse_algorithm_sends(events: &[RawEvent]) -> Result<Vec<SendEvent>> {
+    let mut sends = Vec::new();
+    for event in events {
+        let (src_chunk, chunk_index) = parse_src_chunk(&event.src_chunk)?;
+        for raw_send in &event.sends {
+            sends.push(SendEvent {
+                src_chunk,
+                chunk_index,
+                src_gpu: raw_send.src_gpu,
+                dst_gpu: raw_send.dst_gpu,
+                epoch: raw_send.epoch,
+                layer_used: raw_send.layer_used,
+                order: sends.len(),
+                sketch_source: None,
+            });
+        }
+    }
+    Ok(sends)
+}
+
+fn parse_src_chunk(value: &str) -> Result<(usize, usize)> {
+    let trimmed = value.trim();
+    let inner = trimmed
+        .strip_prefix('(')
+        .and_then(|v| v.strip_suffix(')'))
+        .ok_or_else(|| anyhow!("invalid src_chunk {}", value))?;
+    let mut parts = inner.split(',').map(str::trim);
+    let root = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid src_chunk {}", value))?
+        .parse::<usize>()
+        .with_context(|| format!("invalid src_chunk root {}", value))?;
+    let chunk = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid src_chunk {}", value))?
+        .parse::<usize>()
+        .with_context(|| format!("invalid src_chunk index {}", value))?;
+    if parts.next().is_some() {
+        return Err(anyhow!("invalid src_chunk {}", value));
+    }
+    Ok((root, chunk))
+}
+
+pub fn build_flows(schedule: &TranslatedSchedule, flow_size: u64) -> Result<FlowGraph> {
+    let mut sends = schedule.sends.clone();
+    sends.sort_by_key(|send| (send.epoch, send.order));
+
+    let mut chunk_ids = BTreeMap::new();
+    for send in &sends {
+        let key = (send.src_chunk, send.chunk_index);
+        let next_id = chunk_ids.len();
+        chunk_ids.entry(key).or_insert(next_id);
+    }
+
+    let mut holder_to_flows: HashMap<(usize, usize, usize), Vec<usize>> = HashMap::new();
+    let mut has_chunk: HashSet<(usize, usize, usize)> = HashSet::new();
+    let mut flows = Vec::with_capacity(sends.len());
+
+    for send in &sends {
+        let src_holder = (send.src_chunk, send.chunk_index, send.src_gpu);
+        if send.src_gpu == send.src_chunk {
+            has_chunk.insert(src_holder);
+        }
+        if !has_chunk.contains(&src_holder) {
+            return Err(anyhow!(
+                "send order invalid: GPU {} sends chunk {} before holding it",
+                send.src_gpu,
+                send.src_chunk
+            ));
+        }
+
+        // recv_parents: flows that delivered the chunk to this sender GPU.
+        let mut recv_parents = holder_to_flows
+            .get(&src_holder)
+            .cloned()
+            .unwrap_or_default();
+        recv_parents.sort_unstable();
+        recv_parents.dedup();
+
+        let flow_id = flows.len();
+        flows.push(Flow {
+            id: flow_id,
+            channel_id: *chunk_ids
+                .get(&(send.src_chunk, send.chunk_index))
+                .expect("chunk id allocated"),
+            src_chunk: send.src_chunk,
+            chunk_index: send.chunk_index,
+            src: send.src_gpu,
+            dst: send.dst_gpu,
+            epoch: send.epoch,
+            order: send.order,
+            size_bytes: flow_size,
+            recv_parents,
+            send_parents: Vec::new(),
+            children: Vec::new(),
+            sketch_source: send.sketch_source.clone(),
+        });
+
+        let dst_holder = (send.src_chunk, send.chunk_index, send.dst_gpu);
+        has_chunk.insert(dst_holder);
+        holder_to_flows.insert(dst_holder, vec![flow_id]);
+    }
+
+    // Build child edges from the parent lists for dependency release.
+    for id in 0..flows.len() {
+        let mut parents = flows[id].recv_parents.clone();
+        parents.extend(flows[id].send_parents.iter().copied());
+        parents.sort_unstable();
+        parents.dedup();
+        for parent in parents {
+            if parent >= flows.len() {
+                return Err(anyhow!("flow {} has invalid parent {}", id, parent));
+            }
+            flows[parent].children.push(id);
+        }
+    }
+
+    Ok(FlowGraph {
+        flows,
+        channel_count: chunk_ids.len(),
+    })
+}

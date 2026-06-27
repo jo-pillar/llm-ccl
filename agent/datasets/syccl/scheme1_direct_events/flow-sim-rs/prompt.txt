@@ -1,0 +1,39 @@
+1. 一个集合通信的完成时间是由最后一条流也就是传输任务的结束时间决定的，我们设start_time为集合通信的开始时间，end_time为集合通信的结束时间，那么集合通信的完成时间可以表示为：
+完成时间 = end_time - start_time
+2. 在集合通信中，传输任务的结束时间end_time可以通过计算所有参与节点的传输任务的结束时间来确定。假设有n个节点参与集合通信，每个节点i的传输任务结束时间为end_time_i，那么集合通信的结束时间end_time可以表示为：
+end_time = max(end_time_1, end_time_2, ..., end_time_n)
+3.而end_time_i可以通过节点i的传输任务的开始时间start_time_i和传输任务的持续时间duration_i来计算。假设节点i的传输任务的持续时间为duration_i，那么节点i的传输任务结束时间end_time_i可以表示为：
+end_time_i = start_time_i + duration_i 这里的start_time 也就是prent_release_ns, end_time_i 也就是recv_complete_ns
+4.其中duration_i 可以表示成 
+duration_i = route_busy_ns+route_latency_ns+queue_wait_ns
+我们假设在这条发送任务流上之前的父流从早到晚分别为flow_1, flow_2, ..., flow_k，那么最后的瓶颈链路bottleneck_profile应该这样表达
+从某个src_node发送到某个dst_node 对应chunk[i] is latest，对应的原始sketch transmission 为***， 整条路径为
+[flow:1,chunk:1:src_node->dst_node, flow_start_time: flow_1_start_time, flow_end_time: flow_1_end_time,transmission_time: flow_1_route_busy_ns, propagation_delay: flow_1_route_latency_ns, queue_wait_ns: flow_1_queue_wait_ns]
+[flow:2,chunk:2:src_node->dst_node, flow_start_time: flow_2_start_time, flow_end_time: flow_2_end_time,transmission_time: flow_2_route_busy_ns, propagation_delay: flow_2_route_latency_ns, queue_wait_ns: flow_2_queue_wait_ns]
+...
+
+别的我同意，但最后输出的bottleneck profile的内容就是这些，重新设计方案
+critical_flow_chain:
+    collective_duration_ns
+    latest_flow_id
+    chain:
+      - flow_id
+        chunk:
+          src_chunk
+          chunk_index
+          src_gpu
+          dst_gpu
+        previous_bottleneck_flow_id
+        previous_bottleneck_flow_end_time
+        sketch_transmission:
+          transmission_index
+          step
+          layer
+          group
+          srcs
+          dsts
+        current_flow_start_time current_flow_start_time要等于previous_bottleneck_flow_end_time 尽量选择同一个语义 因为这里面的时延如果存在也是是固定时延，可以忽略
+        propagation_delay_ns
+        transmission_time_ns:
+            link_busy_ns:
+            link_wait_ns:
