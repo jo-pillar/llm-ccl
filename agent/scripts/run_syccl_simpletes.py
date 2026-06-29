@@ -252,39 +252,7 @@ def build_command(
   api_host = urlparse(model_config.get("api_base", "")).hostname
   if _is_private_api_host(api_host):
     _append_no_proxy(env, api_host)
-# 
-# PYTHONPATH=/home/antl/wzd/syccl/agent \
-# PYTHONUNBUFFERED=1 \
-# UV_CACHE_DIR=/tmp/uv-cache \
-# MPLCONFIGDIR=/tmp/matplotlib \
-# SYCCL_BASE_CONFIG=/home/antl/wzd/syccl/config/a100-8gpu-4nic-clos-ag-4k.json \
-# SYCCL_TASK_HOST_NUM=4 \
-# SYCCL_TASK_HOST_GPU_NUM=8 \
-# SYCCL_TASK_NGPUS=32 \
-# SYCCL_TASK_TOPOLOGY=clos \
-# SYCCL_TASK_CROSS_LAYER=4 \
-# SYCCL_TASK_CROSS_GROUP=0 \
-# SYCCL_EVAL_ARTIFACT_DIR=/home/antl/wzd/syccl/agent/debug_runs/syccl_scheme1_llm_elite/eval_artifacts \
-# FLOW_SIM_BIN=/home/antl/wzd/llm-ccl/Flow-Simulator/flow-sim-rs/target/release/flow-sim-rs \
-# python main.py \
-# --init-program init_program.py \
-# --evaluator evaluator.py \
-# --instruction syccl_sketch_4host_clos.txt \
-# --model deepseek/deepseek-v4-flash \
-# --api-base https://api.deepseek.com \
-# --max-generations 3 \
-# --output-path /home/antl/wzd/syccl/agent/debug_runs/syccl_scheme1_llm_elite/checkpoints \
-# --init-eval-repeats 1 \
-# --eval-concurrency 1 \
-# --gen-concurrency 1 \
-# --selector llm_elite \
-# --num-chains 1 \
-# --k-candidates 1 \
-# --restart-every-n 1 \
-# --llm-policy-pool-size 3 \
-# --elite-selection-strategy all \
-# --save-llm-io \
-# --skip-preflight
+
 
 # 如果你要的是第二个“dry startup”配置，或者第三个 pytest 配置，我也可以继续帮你还原成对应的终端命令。
   command = [
