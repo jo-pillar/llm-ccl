@@ -40,14 +40,11 @@ Required return format:
 - Preferred compact transmission form:
 
 ```python
-(step, layer, group, srcs, dsts)
+(step, chunk，layer, group, srcs, dsts)
 ```
 
 - `srcs` and `dsts` may each be a single GPU id or a list of GPU ids.
-- If `srcs` contains multiple GPUs, all listed sources must already have the chunk
-  before this step. During direct-event expansion, destinations in that
-  transmission are assigned across the listed sources in order, which can express
-  parallel fanout from several relays inside one layer/group.
+- If `srcs` contains multiple GPUs, all listed sources must already have the chunk before this step. During direct-event expansion, destinations in that transmission are assigned across the listed sources in order, which can express parallel fanout from several relays inside one layer/group.
 - Dict form is also accepted:
 
 ```python

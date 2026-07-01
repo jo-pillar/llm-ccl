@@ -1,0 +1,150 @@
+{
+  "coll": {
+    "name": "allgather",
+    "byte": 16777216,
+    "root_sender": -1,
+    "root_receiver": -1
+  },
+  "hosts": {
+    "host_num": 2,
+    "host_gpu_num": 8,
+    "host_nic_num": 2,
+    "host_links": "nvlink"
+  },
+  "topo": [
+    {
+      "layer_id": 0,
+      "type": "local",
+      "link_spec": "memcpy"
+    },
+    {
+      "layer_id": 1,
+      "type": "host",
+      "link_spec": "nvlink_nv2"
+    },
+    {
+      "layer_id": 2,
+      "type": "nic",
+      "link_spec": "link_nic"
+    },
+    {
+      "layer_id": 3,
+      "type": "switch",
+      "switch_topo": "pod",
+      "switch_num": 1,
+      "link_spec": "netlink_leaf"
+    },
+    {
+      "layer_id": 4,
+      "type": "switch",
+      "switch_topo": "pod",
+      "switch_num": 1,
+      "link_spec": "netlink_spine"
+    }
+  ],
+  "host_links": {
+    "torus": {
+      "dim_num": 2,
+      "per_dim_num": [
+        4,
+        4
+      ]
+    },
+    "nvlink_by_link_spec": {
+      "nvlink_nv2": [
+        [
+          2,
+          7
+        ],
+        [
+          3,
+          6
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          5,
+          6
+        ],
+        [
+          4,
+          7
+        ],
+        [
+          1,
+          4
+        ],
+        [
+          0,
+          5
+        ]
+      ],
+      "nvlink_nv1": [
+        [
+          1,
+          3
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          5
+        ],
+        [
+          0,
+          4
+        ],
+        [
+          3,
+          7
+        ],
+        [
+          2,
+          6
+        ],
+        [
+          5,
+          7
+        ],
+        [
+          4,
+          6
+        ]
+      ]
+    }
+  },
+  "link_spec": {
+    "memcpy": {
+      "bw_mbpus": 10,
+      "lat_us": 0.01
+    },
+    "nvlink_nv2": {
+      "bw_mbpus": 0.05,
+      "lat_us": 9
+    },
+    "nvlink_nv1": {
+      "bw_mbpus": 0.025,
+      "lat_us": 9
+    },
+    "link_nic": {
+      "bw_mbpus": 0.0125,
+      "lat_us": 0
+    },
+    "netlink_leaf": {
+      "bw_mbpus": 0.0125,
+      "lat_us": 25
+    },
+    "netlink_spine": {
+      "bw_mbpus": 0.36,
+      "lat_us": 25
+    }
+  }
+}
