@@ -84,7 +84,6 @@ class ClosTopology(BaseTopology):
         spine_num = leaf_spine_spec.group_num
         leaf_per_spine = leaf_spine_spec.node_num
         assert leaf_num == leaf_per_spine, "Mismatch between leaf count and Layer 3 node specification."
-
         for leaf_id in range(leaf_num):
             for spine_id in range(spine_num):
                 src_node = Node(node_id=f"leaf[{leaf_id}]", node_type=NodeType.SWITCH)
@@ -97,7 +96,7 @@ topology = ClosTopology(
     "1MB",
     CollectiveType.ALLGATHER,
     layer0=LayerSpec(1, LinkSpec("50GBps", "9us"), group_num=8, node_num=8, node_type=NodeType.GPU),
-    layer1=LayerSpec(2, LinkSpec("12.5GBps", "25us"), group_num=8, node_num=1, node_type=NodeType.SWITCH),
+    layer1=LayerSpec(2, LinkSpec("12.5GBps", "0us"), group_num=8, node_num=1, node_type=NodeType.NIC),
     layer2=LayerSpec(3, LinkSpec("12.5GBps", "25us"), group_num=2, node_num=4, node_type=NodeType.SWITCH),
     layer3=LayerSpec(4, LinkSpec("400GBps", "25us"), group_num=1, node_num=2, node_type=NodeType.SWITCH),
 )
