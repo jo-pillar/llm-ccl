@@ -14,7 +14,12 @@ from simpletes.templates.generation import (
     FAILURE_PATTERNS_TEMPLATE,
 )
 from simpletes.templates.elite_selection import ELITE_SELECTION_PROMPT_TEMPLATE
-from simpletes.templates.elite_context import ELITE_CONTEXT_TEMPLATE, ELITE_ENTRY_TEMPLATE
+from simpletes.templates.elite_context import (
+    ELITE_ALL_CONTEXT_TEMPLATE,
+    ELITE_CONTEXT_TEMPLATE,
+    ELITE_ENTRY_TEMPLATE,
+    ELITE_REFLECTION_RECORD_TEMPLATE,
+)
 from simpletes.templates.mcts_selection import (
     MCTS_SELECTION_PROMPT_TEMPLATE,
     MCTS_INSPIRATION_ITEM_TEMPLATE,
@@ -31,8 +36,10 @@ __all__ = [
     # Elite selection (llm_elite)
     "ELITE_SELECTION_PROMPT_TEMPLATE",
     # Elite context (for generator)
+    "ELITE_ALL_CONTEXT_TEMPLATE",
     "ELITE_CONTEXT_TEMPLATE",
     "ELITE_ENTRY_TEMPLATE",
+    "ELITE_REFLECTION_RECORD_TEMPLATE",
     # MCTS selection
     "MCTS_SELECTION_PROMPT_TEMPLATE",
     "MCTS_INSPIRATION_ITEM_TEMPLATE",
