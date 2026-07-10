@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import re
 from datetime import datetime
@@ -7,15 +8,32 @@ from typing import TYPE_CHECKING, Any
 
 from simpletes.evaluator import rich_print
 from simpletes.templates import (
+    ELITE_ALL_CONTEXT_TEMPLATE,
     ELITE_SELECTION_PROMPT_TEMPLATE,
     ELITE_CONTEXT_TEMPLATE,
     ELITE_ENTRY_TEMPLATE,
+    ELITE_REFLECTION_RECORD_TEMPLATE,
 )
 
 from .base import TrajectoryPolicyBase, PendingFinalize, register_selector
 
 if TYPE_CHECKING:
     from simpletes.node import Node, NodeDatabase, NodeDatabaseSnapshot
+
+
+_ELITE_REFLECTION_MAX_CHARS = 800
+_BEST_BOTTLENECK_MAX_CHARS = 12000
+
+
+def _score_or_floor(node: Node) -> float:
+    return node.score if node.score is not None else -1e9
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
 
 
 @register_selector("llm_elite")
@@ -328,7 +346,6 @@ class LLMElitePolicy(TrajectoryPolicyBase):
 
     def _select_from_chain(self, chain_idx: int, chain_nodes: list[Node], n: int) -> list[Node]:
         elite_list = self.elite_sets[chain_idx]
-        print(elite_list)
 
         # Initialize elite pool from chain nodes if empty
         if not elite_list:
@@ -339,8 +356,9 @@ class LLMElitePolicy(TrajectoryPolicyBase):
             return []
 
         if self.elite_selection_strategy == "all":
-            assert n <= self.elite_limit, "n must not be greater than elite_limit when elite_selection_strategy is all"
-            return list(elite_list)  # Return all nodes
+            # "all" means the full elite pool is represented in policy context,
+            # while only the best candidate is included as full-code inspiration.
+            return [max(elite_list, key=_score_or_floor)]
         elif self.elite_selection_strategy == "balance":
             return self._select_balance(elite_list, n)
         else:  # default: linear_rank
@@ -427,9 +445,12 @@ class LLMElitePolicy(TrajectoryPolicyBase):
         # Sort by score descending for display
         sorted_elites = sorted(
             elite_list,
-            key=lambda x: x.score if x.score is not None else -1e9,
+            key=_score_or_floor,
             reverse=True
         )
+
+        if self.elite_selection_strategy == "all":
+            return self._get_all_strategy_policy_context(sorted_elites)
 
         entries = []
         for i, node in enumerate(sorted_elites, 1):
@@ -469,6 +490,44 @@ class LLMElitePolicy(TrajectoryPolicyBase):
             chain_idx=chain_idx,
             entries="".join(entries),
         )
+
+    def _get_all_strategy_policy_context(self, sorted_elites: list[Node]) -> str:
+        best_node = sorted_elites[0]
+        best_score = f"{best_node.score:.6f}" if best_node.score is not None else "N/A"
+        best_bottleneck_profile = self._format_best_bottleneck_profile(best_node)
+
+        records = []
+        for i, node in enumerate(sorted_elites[1:], 1):
+            score_str = f"{node.score:.6f}" if node.score is not None else "N/A"
+            reflection = node.reflection.strip() if node.reflection else "(no reflection recorded)"
+            records.append(ELITE_REFLECTION_RECORD_TEMPLATE.format(
+                index=i,
+                score=score_str,
+                node_id=node.id,
+                reflection=_truncate_text(reflection, _ELITE_REFLECTION_MAX_CHARS),
+            ))
+
+        reflection_records = "".join(records) if records else "(no other elite records)\n"
+
+        return ELITE_ALL_CONTEXT_TEMPLATE.format(
+            num_elites=len(sorted_elites),
+            best_node_id=best_node.id,
+            best_score=best_score,
+            best_bottleneck_profile=best_bottleneck_profile,
+            reflection_records=reflection_records,
+        )
+
+    def _format_best_bottleneck_profile(self, node: Node) -> str:
+        metrics = node.metrics if isinstance(node.metrics, dict) else {}
+        profile = metrics.get("bottleneck_profile")
+        if profile is None:
+            return "(no bottleneck_profile recorded)"
+
+        try:
+            text = json.dumps(profile, ensure_ascii=True, indent=2, sort_keys=True, default=str)
+        except TypeError:
+            text = repr(profile)
+        return _truncate_text(text, _BEST_BOTTLENECK_MAX_CHARS)
 
     # ------------------------------------------------------------------
     # Serialization
