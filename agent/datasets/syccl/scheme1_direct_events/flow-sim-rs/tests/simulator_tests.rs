@@ -655,6 +655,64 @@ fn compact_sketch_expands_and_simulates_without_translated_file() {
 }
 
 #[test]
+fn simulate_sketch_cli_can_dump_translated_schedule_for_syccl_resim() {
+    let root = tempdir().unwrap();
+    let config_path = root.path().join("config.json");
+    let sketch_path = root.path().join("sketch.json");
+    let output_path = root.path().join("sketch-profile.json");
+    let translated_path = root.path().join("candidate-translated.json");
+    fs::write(&config_path, fixture_config()).unwrap();
+    fs::write(
+        &sketch_path,
+        r#"[
+          [
+            [0, 1, 0, 0, 1],
+            [0, 3, 0, 0, 2],
+            [1, 1, 1, 2, 3]
+          ]
+        ]"#,
+    )
+    .unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_flow-sim-rs"))
+        .arg("simulate-sketch")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--sketch")
+        .arg(&sketch_path)
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--dump-translated")
+        .arg(&translated_path)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let translated: serde_json::Value =
+        serde_json::from_slice(&fs::read(&translated_path).unwrap()).unwrap();
+    assert_eq!(translated["coll_name"], "allgather");
+    assert_eq!(translated["ngpus"], 4);
+    assert_eq!(translated["chunk_size_byte"], 4096);
+    assert_eq!(translated["algorithms"].as_array().unwrap().len(), 1);
+    let schedule = &translated["algorithms"][0]["final_schedule"]["Schedule"];
+    assert_eq!(schedule["chunk_sizes"].as_array().unwrap().len(), 4);
+    assert_eq!(schedule["init_devs"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        schedule["init_devs"],
+        serde_json::json!([
+            [[0, 0], [0]],
+            [[1, 0], [1]],
+            [[2, 0], [5]],
+            [[3, 0], [6]]
+        ])
+    );
+    assert_eq!(schedule["Events"].as_array().unwrap().len(), 4);
+    assert_eq!(schedule["Events"][0]["src_chunk"], "(0, 0)");
+    assert_eq!(schedule["Events"][0]["sends"][0]["copy"], true);
+    assert_eq!(schedule["Events"][0]["sends"][0]["reduce"], false);
+}
+
+#[test]
 fn compact_sketch_maps_multiple_sources_to_destination_chunks() {
     let config = parse_config(clos_config().as_bytes()).unwrap();
     let sketches = parse_compact_sketches(

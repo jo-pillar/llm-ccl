@@ -11,7 +11,9 @@ use flow_sim_rs::batch::{
 use flow_sim_rs::batch_sketch::{build_sketch_manifest, run_sketch_batch, write_sketch_manifest};
 use flow_sim_rs::compare::{compare_manifest, write_compare_report};
 use flow_sim_rs::config::parse_config;
-use flow_sim_rs::schedule::{parse_all_translated_schedules, parse_translated_schedule};
+use flow_sim_rs::schedule::{
+    parse_all_translated_schedules, parse_translated_schedule, to_syccl_resim_input,
+};
 use flow_sim_rs::simulator::{simulate_case, SimulationResult};
 use flow_sim_rs::sketch::{parse_compact_sketches, sketches_to_translated_schedule};
 use serde::Serialize;
@@ -46,6 +48,8 @@ enum Commands {
         sketch: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        dump_translated: Option<PathBuf>,
     },
     Manifest {
         #[arg(long)]
@@ -122,7 +126,8 @@ fn main() -> Result<()> {
             config,
             sketch,
             output,
-        } => simulate_sketch_cmd(&config, &sketch, &output),
+            dump_translated,
+        } => simulate_sketch_cmd(&config, &sketch, &output, dump_translated.as_deref()),
         Commands::Manifest {
             config,
             input_dir,
@@ -289,7 +294,12 @@ fn simulate_cmd(
     Ok(())
 }
 
-fn simulate_sketch_cmd(config: &Path, sketch: &Path, output: &Path) -> Result<()> {
+fn simulate_sketch_cmd(
+    config: &Path,
+    sketch: &Path,
+    output: &Path,
+    dump_translated: Option<&Path>,
+) -> Result<()> {
     let config_file =
         File::open(config).with_context(|| format!("failed to open {}", config.display()))?;
     let sketch_file =
@@ -297,6 +307,14 @@ fn simulate_sketch_cmd(config: &Path, sketch: &Path, output: &Path) -> Result<()
     let config_data = parse_config(config_file)?;
     let sketches = parse_compact_sketches(sketch_file, &config_data)?;
     let schedule = sketches_to_translated_schedule(&sketches, &config_data)?;
+    if let Some(translated_path) = dump_translated {
+        if let Some(parent) = translated_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = File::create(translated_path)
+            .with_context(|| format!("failed to create {}", translated_path.display()))?;
+        serde_json::to_writer_pretty(file, &to_syccl_resim_input(&schedule, &config_data)?)?;
+    }
     let result = simulate_case(&config_data, &schedule)?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;

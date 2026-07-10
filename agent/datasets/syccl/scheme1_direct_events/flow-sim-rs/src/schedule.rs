@@ -4,6 +4,8 @@ use std::io::{BufReader, Read};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::SimConfig;
+
 #[derive(Debug, Clone, Deserialize)]
 struct RawTranslated {
     coll_name: Option<String>,
@@ -103,6 +105,135 @@ pub struct Flow {
 pub struct FlowGraph {
     pub flows: Vec<Flow>,
     pub channel_count: usize,
+}
+
+pub fn to_syccl_resim_input(
+    schedule: &TranslatedSchedule,
+    config: &SimConfig,
+) -> Result<serde_json::Value> {
+    let chunk_size_byte = schedule.chunk_size_byte.unwrap_or(config.coll_bytes);
+    let total_gpus = config.hosts.host_num * config.hosts.gpus_per_host;
+    if schedule.ngpus != total_gpus {
+        return Err(anyhow!(
+            "translated schedule ngpus {} does not match config topology {}",
+            schedule.ngpus,
+            total_gpus
+        ));
+    }
+    if schedule
+        .coll_name
+        .as_deref()
+        .is_some_and(|name| name != config.coll_name)
+    {
+        return Err(anyhow!(
+            "translated schedule collective {:?} does not match config collective {}",
+            schedule.coll_name,
+            config.coll_name
+        ));
+    }
+
+    let chunk_keys = syccl_resim_chunk_keys(schedule, config)?;
+    let mut sends_by_chunk: BTreeMap<(usize, usize), Vec<&SendEvent>> = BTreeMap::new();
+    for send in &schedule.sends {
+        sends_by_chunk
+            .entry((send.src_chunk, send.chunk_index))
+            .or_default()
+            .push(send);
+    }
+
+    let init_devs: Vec<_> = chunk_keys
+        .iter()
+        .copied()
+        .map(|(src_chunk, chunk_index)| {
+            let dev = syccl_gpu_device_id(src_chunk, config)?;
+            Ok(serde_json::json!([[src_chunk, chunk_index], [dev]]))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let chunk_sizes: Vec<_> = chunk_keys
+        .iter()
+        .copied()
+        .map(|(src_chunk, chunk_index)| {
+            serde_json::json!([[src_chunk, chunk_index], chunk_size_byte])
+        })
+        .collect();
+    let events: Vec<_> = sends_by_chunk
+        .into_iter()
+        .map(|((src_chunk, chunk_index), mut sends)| {
+            sends.sort_by_key(|send| (send.epoch, send.order));
+            let sends_json: Vec<_> = sends
+                .into_iter()
+                .map(|send| {
+                    serde_json::json!({
+                        "src_gpu": send.src_gpu,
+                        "dst_gpu": send.dst_gpu,
+                        "epoch": send.epoch,
+                        "copy": true,
+                        "reduce": false,
+                        "layer_used": send.layer_used.unwrap_or(-1),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "src_chunk": format!("({}, {})", src_chunk, chunk_index),
+                "sends": sends_json,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "coll_name": config.coll_name,
+        "ngpus": schedule.ngpus,
+        "chunk_size_byte": chunk_size_byte,
+        "algorithms": [{
+            "chunk_size_B": chunk_size_byte,
+            "final_schedule": {
+                "Schedule": {
+                    "init_devs": init_devs,
+                    "chunk_sizes": chunk_sizes,
+                    "Events": events,
+                }
+            }
+        }]
+    }))
+}
+
+fn syccl_resim_chunk_keys(
+    schedule: &TranslatedSchedule,
+    config: &SimConfig,
+) -> Result<Vec<(usize, usize)>> {
+    match config.coll_name.as_str() {
+        "allgather" => Ok((0..schedule.ngpus).map(|gpu| (gpu, 0)).collect()),
+        "alltoall" => Ok((0..schedule.ngpus)
+            .flat_map(|src| (0..schedule.ngpus).map(move |dst| (src, dst)))
+            .collect()),
+        other => Err(anyhow!(
+            "unsupported collective {other}, expected allgather or alltoall"
+        )),
+    }
+}
+
+fn syccl_gpu_device_id(gpu: usize, config: &SimConfig) -> Result<usize> {
+    let total_gpus = config.hosts.host_num * config.hosts.gpus_per_host;
+    if gpu >= total_gpus {
+        return Err(anyhow!(
+            "GPU {} is out of range for topology with {} GPUs",
+            gpu,
+            total_gpus
+        ));
+    }
+    let switch_count = match config.hosts.host_links.as_str() {
+        "nvswitch" => 1,
+        "nvlink" => 0,
+        other => {
+            return Err(anyhow!(
+                "unsupported host_links {other:?}, expected nvswitch or nvlink"
+            ))
+        }
+    };
+    let host = gpu / config.hosts.gpus_per_host;
+    let local_gpu = gpu % config.hosts.gpus_per_host;
+    let devices_per_host = config.hosts.gpus_per_host + config.hosts.nics_per_host + switch_count;
+    Ok(host * devices_per_host + local_gpu)
 }
 
 pub fn parse_translated_schedule<R: Read>(reader: R) -> Result<TranslatedSchedule> {
