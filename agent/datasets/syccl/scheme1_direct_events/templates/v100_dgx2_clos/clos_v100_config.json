@@ -1,0 +1,67 @@
+{
+  "coll": {
+    "name": "allgather",
+    "byte": 2048,
+    "root_sender": -1,
+    "root_receiver": -1
+  },
+  "hosts": {
+    "host_num": 2,
+    "host_gpu_num": 16,
+    "host_nic_num": 1,
+    "host_links": "nvswitch"
+  },
+  "topo": [
+    {
+      "layer_id": 0,
+      "type": "local",
+      "link_spec": "memcpy"
+    },
+    {
+      "layer_id": 1,
+      "type": "host",
+      "link_spec": "nvswitch"
+    },
+    {
+      "layer_id": 2,
+      "type": "nic",
+      "link_spec": "link_nic"
+    },
+    {
+      "layer_id": 3,
+      "type": "switch",
+      "switch_topo": "pod",
+      "switch_num": 2,
+      "link_spec": "netlink_leaf"
+    },
+    {
+      "layer_id": 4,
+      "type": "switch",
+      "switch_topo": "pod",
+      "switch_num": 1,
+      "link_spec": "netlink_spine"
+    }
+  ],
+  "link_spec": {
+    "memcpy": {
+      "bw_mbpus": 10,
+      "lat_us": 0.01
+    },
+    "nvswitch": {
+      "bw_mbpus": 0.125,
+      "lat_us": 3
+    },
+    "link_nic": {
+      "bw_mbpus": 0.0125,
+      "lat_us": 0
+    },
+    "netlink_leaf": {
+      "bw_mbpus": 0.0125,
+      "lat_us": 25
+    },
+    "netlink_spine": {
+      "bw_mbpus": 0.4,
+      "lat_us": 25
+    }
+  }
+}

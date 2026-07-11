@@ -1,0 +1,59 @@
+Optimize Collective sketch generation for a ${GPU_NUM} GPU cluster ${Collective} target.
+
+You are evolving Python code that returns one candidate single-root broadcast tree
+encoded as Concrete SketchDSL. The evaluator rotates that tree across all ${GPU_NUM} roots, expands
+it into the full ${Collective} event schedule, and evaluates it with flow-sim-rs.
+
+Optimization objective:
+
+    combined_score = coll.byte / simulated_time_us
+
+Higher `combined_score` is better. Since `coll.byte` is fixed for an experiment case,
+minimize the simulated `time_us` while avoiding contention after root rotation.
+
+Topology and link costs:
+${TOPOLOGY}
+
+Interpretation:
+- Layer 1 is the 125 GB/s, 3 us DGX-2 host-local NVSwitch fabric. Use it for fanout among the 16 GPUs in one host.
+- Layer 2 describes GPU-to-NIC attachment and is not valid in Concrete SketchDSL.
+- Layer 3 describes GPUs grouped behind one Clos leaf. It can express leaf-local communication when a leaf contains multiple hosts.
+- Layer 4 crosses the Clos spine and is required for communication between the two DGX-2 hosts in this topology.
+- The rotated ${Collective} pattern should avoid serializing too many inter-host sends through the same relay.
+
+Required return format:
+- Implement `construct_sketches()`.
+- Return exactly one sketch, represented as a list of compact transmissions.
+- Preferred transmission form:
+
+```python
+(step, layer, group, srcs, dsts)
+```
+
+- `srcs` and `dsts` may each be one integer GPU id or a flat list of integer GPU ids.
+- If `srcs` contains multiple GPUs, every source must already hold the chunk before that step.
+- Dict form is also accepted:
+
+```python
+{"step": 0, "layer": 1, "group": 0, "srcs": [0], "dsts": [1, 2, 3]}
+```
+
+Validity constraints:
+- Use only layers 1, 3, and 4. Never use layer 2.
+- A transmission's sources and destinations must all belong to the selected layer/group.
+- GPU ids must be integers in 0..${GPU_NUM}-1.
+- GPU 0 starts with the root chunk.
+- Every GPU 1..${GPU_NUM}-1 must be reached exactly once; GPU 0 must not be a destination.
+- A GPU may be a source only in a strictly later step than the step that first reaches it, except GPU 0.
+- No transmission may repeat a destination, and the full sketch may not deliver to one GPU twice.
+
+Design guidance:
+- Design a fast broadcast tree for root 0, then reason about contention when it is rotated across all roots.
+- Use NVSwitch fanout to create multiple local relays before crossing layer 4 where useful.
+- Balance the number and timing of cross-host sends against serialization on the single NIC per host.
+- Return only one sketch per generated program.
+
+Evaluator metrics:
+- `combined_score`: the only score to maximize.
+- `validity`: 1.0 for a valid sketch that simulates successfully, 0.0 otherwise.
+- `bottleneck_profile`: critical-flow-chain feedback for diagnosing serialization and link wait.
