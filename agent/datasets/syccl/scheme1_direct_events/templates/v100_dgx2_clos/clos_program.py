@@ -1,5 +1,5 @@
 # EVOLVE-BLOCK-START
-"""Initial double-ring Concrete SketchDSL for a two-host DGX-2 Clos topology."""
+"""Initial double-ring Concrete SketchDSL for a multi-host DGX-2 Clos topology."""
 
 
 def tx(step, layer, group, srcs, dsts):
@@ -7,7 +7,7 @@ def tx(step, layer, group, srcs, dsts):
   return (step, layer, group, srcs, dsts)
 
 
-def construct_sketches(ngpus: int = 32, root_gpu: int = 0, gpus_per_host: int = 16, hosts_per_leaf: int = 1):
+def construct_sketches(ngpus: int = 64, root_gpu: int = 0, gpus_per_host: int = 16, hosts_per_leaf: int = 1):
   """Return a topology-aware single-root broadcast Concrete SketchDSL."""
   def ring_gpu(offset):
     return (root_gpu + offset) % ngpus

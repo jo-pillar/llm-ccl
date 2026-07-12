@@ -18,7 +18,7 @@ Interpretation:
 - Layer 1 is the 125 GB/s, 3 us DGX-2 host-local NVSwitch fabric. Use it for fanout among the 16 GPUs in one host.
 - Layer 2 describes GPU-to-NIC attachment and is not valid in Concrete SketchDSL.
 - Layer 3 describes GPUs grouped behind one Clos leaf. It can express leaf-local communication when a leaf contains multiple hosts.
-- Layer 4 crosses the Clos spine and is required for communication between the two DGX-2 hosts in this topology.
+- Layer 4 crosses the Clos spine and is required for communication between DGX-2 hosts in this topology.
 - The rotated ${Collective} pattern should avoid serializing too many inter-host sends through the same relay.
 
 Required return format:

@@ -1,12 +1,12 @@
 {
   "coll": {
     "name": "allgather",
-    "byte": 2048,
+    "byte": 1024,
     "root_sender": -1,
     "root_receiver": -1
   },
   "hosts": {
-    "host_num": 2,
+    "host_num": 4,
     "host_gpu_num": 16,
     "host_nic_num": 1,
     "host_links": "nvswitch"
@@ -31,7 +31,7 @@
       "layer_id": 3,
       "type": "switch",
       "switch_topo": "pod",
-      "switch_num": 2,
+      "switch_num": 4,
       "link_spec": "netlink_leaf"
     },
     {

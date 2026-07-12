@@ -31,17 +31,10 @@ DEFAULT_OUTPUT_ROOT = (
     / f"v100-dgx2-clos-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
 )
 DEFAULT_FLOW_SIM_BIN = DATASET_ROOT / "flow-sim-rs" / "target" / "release" / "flow-sim-rs"
-EXPERIMENT_REL = Path("v100-dgx2-2hosts-16gpu-1nic-clos") / "ag"
 TOPOLOGY_TEMPLATE_NAME = "clos_topo.py"
 CONFIG_TEMPLATE_NAME = "clos_v100_config.json"
 INIT_PROGRAM_TEMPLATE_NAME = "clos_program.py"
 
-HOSTS = 2
-GPUS_PER_HOST = 16
-NICS_PER_HOST = 1
-LEAF_SWITCHES = 2
-SPINE_SWITCHES = 1
-TOTAL_GPUS = HOSTS * GPUS_PER_HOST
 TOTAL_MESSAGE_SIZES = tuple(4 ** power for power in range(8, 20))
 
 STRATEGIES = ("linear_rank", "balance", "all")
@@ -55,6 +48,52 @@ class CaseSpec(NamedTuple):
   name: str
   total_message_size: int
   config_coll_byte: int
+
+
+class ScaleSpec(NamedTuple):
+  hosts: int
+
+  @property
+  def gpus_per_host(self) -> int:
+    return 16
+
+  @property
+  def nics_per_host(self) -> int:
+    return 1
+
+  @property
+  def spine_switches(self) -> int:
+    return 1
+
+  @property
+  def total_gpus(self) -> int:
+    return self.hosts * self.gpus_per_host
+
+  @property
+  def leaf_switches(self) -> int:
+    return self.hosts
+
+  @property
+  def name(self) -> str:
+    return f"{self.hosts}hosts-{self.total_gpus}gpu"
+
+  @property
+  def experiment_rel(self) -> Path:
+    return Path(
+        f"v100-dgx2-{self.hosts}hosts-{self.gpus_per_host}gpu-{self.nics_per_host}nic-clos"
+    ) / "ag"
+
+
+SCALE_SPECS = (ScaleSpec(4), ScaleSpec(8))
+
+
+def scale_summary(scales: Iterable[ScaleSpec] = SCALE_SPECS) -> str:
+  return " and ".join(f"{scale.hosts}-host" for scale in scales)
+
+
+def bundle_experiment_id(scales: Iterable[ScaleSpec] = SCALE_SPECS) -> str:
+  scale_slug = "-".join(f"{scale.hosts}host" for scale in scales)
+  return f"v100-dgx2-clos-{scale_slug}/ag"
 
 
 def size_label(size: int) -> str:
@@ -86,20 +125,23 @@ def parse_message_sizes(value: str) -> tuple[int, ...]:
   return tuple(parse_message_size(part) for part in value.split(",") if part.strip())
 
 
-def build_case_specs(message_sizes: Iterable[int] = TOTAL_MESSAGE_SIZES) -> list[CaseSpec]:
+def build_case_specs(
+    scale: ScaleSpec,
+    message_sizes: Iterable[int] = TOTAL_MESSAGE_SIZES,
+) -> list[CaseSpec]:
   sizes = tuple(int(size) for size in message_sizes)
   if not sizes:
     raise ValueError("message size sweep must not be empty")
   for size in sizes:
     if size <= 0:
       raise ValueError(f"message size must be positive: {size}")
-    if size % TOTAL_GPUS != 0:
-      raise ValueError(f"message size must be divisible by total GPU count {TOTAL_GPUS}: {size}")
+    if size % scale.total_gpus != 0:
+      raise ValueError(f"message size must be divisible by total GPU count {scale.total_gpus}: {size}")
   return [
       CaseSpec(
           name=f"{size_label(total_message_size)}-total",
           total_message_size=total_message_size,
-          config_coll_byte=total_message_size // TOTAL_GPUS,
+          config_coll_byte=total_message_size // scale.total_gpus,
       )
       for total_message_size in sizes
   ]
@@ -119,17 +161,17 @@ def default_init_program_for_template_dir(template_dir: Path) -> Path:
   return candidate
 
 
-def render_topodsl(case: CaseSpec, template_text: str) -> str:
-  if HOSTS % LEAF_SWITCHES != 0:
-    raise ValueError("HOSTS must be divisible by LEAF_SWITCHES for V100 Clos template generation")
+def render_topodsl(case: CaseSpec, template_text: str, scale: ScaleSpec) -> str:
+  if scale.hosts % scale.leaf_switches != 0:
+    raise ValueError("host count must be divisible by leaf switch count for V100 Clos template generation")
   instantiation = f'''topology = DGX2ClosTopology(
-    {TOTAL_GPUS},
+    {scale.total_gpus},
     {case.total_message_size},
     CollectiveType.ALLGATHER,
-    layer1=LayerSpec(1, LinkSpec("125GB/s", "3us"), group_num={HOSTS}, node_num={GPUS_PER_HOST}, node_type=NodeType.GPU),
-    layer2=LayerSpec(2, LinkSpec("12.5GB/s", "0us"), group_num={HOSTS}, node_num={NICS_PER_HOST}, node_type=NodeType.NIC),
-    layer3=LayerSpec(3, LinkSpec("12.5GB/s", "25us"), group_num={LEAF_SWITCHES}, node_num={HOSTS // LEAF_SWITCHES}, node_type=NodeType.SWITCH),
-    layer4=LayerSpec(4, LinkSpec("400GB/s", "25us"), group_num={SPINE_SWITCHES}, node_num={LEAF_SWITCHES}, node_type=NodeType.SWITCH),
+    layer1=LayerSpec(1, LinkSpec("125GB/s", "3us"), group_num={scale.hosts}, node_num={scale.gpus_per_host}, node_type=NodeType.GPU),
+    layer2=LayerSpec(2, LinkSpec("12.5GB/s", "0us"), group_num={scale.hosts}, node_num={scale.nics_per_host}, node_type=NodeType.NIC),
+    layer3=LayerSpec(3, LinkSpec("12.5GB/s", "25us"), group_num={scale.leaf_switches}, node_num={scale.hosts // scale.leaf_switches}, node_type=NodeType.SWITCH),
+    layer4=LayerSpec(4, LinkSpec("400GB/s", "25us"), group_num={scale.spine_switches}, node_num={scale.leaf_switches}, node_type=NodeType.SWITCH),
 )
 '''
   rendered, count = re.subn(
@@ -147,7 +189,7 @@ def total_gpus(topo: TopoDSLSpec) -> int:
   return topo.params.hosts * topo.params.gpus_per_host
 
 
-def build_resimulation_config(case: CaseSpec, template_config: dict) -> dict:
+def build_resimulation_config(case: CaseSpec, template_config: dict, scale: ScaleSpec) -> dict:
   config = copy.deepcopy(template_config)
   config["coll"] = {
       "name": "allgather",
@@ -156,15 +198,15 @@ def build_resimulation_config(case: CaseSpec, template_config: dict) -> dict:
       "root_receiver": -1,
   }
   config["hosts"] = {
-      "host_num": HOSTS,
-      "host_gpu_num": GPUS_PER_HOST,
-      "host_nic_num": NICS_PER_HOST,
+      "host_num": scale.hosts,
+      "host_gpu_num": scale.gpus_per_host,
+      "host_nic_num": scale.nics_per_host,
       "host_links": "nvswitch",
   }
   config.pop("host_links", None)
   _set_layer_link_spec(config, layer_id=1, link_spec="nvswitch")
-  _set_switch_num(config, layer_id=3, switch_num=LEAF_SWITCHES)
-  _set_switch_num(config, layer_id=4, switch_num=SPINE_SWITCHES)
+  _set_switch_num(config, layer_id=3, switch_num=scale.leaf_switches)
+  _set_switch_num(config, layer_id=4, switch_num=scale.spine_switches)
   config["link_spec"]["nvswitch"] = {"bw_mbpus": 0.125, "lat_us": 3}
   config["link_spec"]["netlink_spine"] = {"bw_mbpus": 0.4, "lat_us": 25}
   config["sketch"] = {
@@ -285,7 +327,7 @@ def write_run_scripts(
       f.write(
           "\t".join(
               [
-                  row["case"],
+                  row["case_id"],
                   row["strategy"],
                   row["config_path"],
                   row["instruction_path"],
@@ -415,24 +457,24 @@ xargs -P "${{LLM_MAX_PARALLEL:-{max_parallel}}}" -n 9 "$SCRIPT_DIR/run_one.sh" <
 
 
 def write_start_commands(
-    output_root: Path,
-    base_dir: Path,
+    bundle_root: Path,
     *,
     model: str,
     api_base: str,
     max_tokens: int,
     task_count: int,
+    scales: Iterable[ScaleSpec] = SCALE_SPECS,
 ) -> Path:
-  start_commands = output_root / "START_COMMANDS.md"
-  run_all = base_dir / "runs" / "run_all.sh"
-  nohup_log = base_dir / "runs" / "run_all.nohup.log"
-  pid_file = base_dir / "runs" / "run_all.pid"
+  start_commands = bundle_root / "START_COMMANDS.md"
+  run_all = bundle_root / "runs" / "run_all.sh"
+  nohup_log = bundle_root / "runs" / "run_all.nohup.log"
+  pid_file = bundle_root / "runs" / "run_all.pid"
   start_commands.write_text(
       f'''# V100 DGX-2 Clos Search Launch Commands
 
-This search launch bundle contains {task_count} tasks and is prepared but not started.
+This {scale_summary(scales)} search launch bundle contains {task_count} tasks and is prepared but not started.
 
-Bundle root: `{base_dir}`
+Bundle root: `{bundle_root}`
 
 ## Start
 
@@ -455,12 +497,106 @@ tail -f {nohup_log}
 ```
 
 ```bash
-find {base_dir / "logs"} -name '*.status' -print -exec cat {{}} \\;
+find {bundle_root} -path '*/logs/*.status' -print -exec cat {{}} \\;
 ```
 ''',
       encoding="utf-8",
   )
   return start_commands
+
+
+def prepare_scale_inputs(
+    *,
+    scale: ScaleSpec,
+    bundle_root: Path,
+    topology_template: str,
+    resimulation_config_template: dict,
+    resolved_instruction_template: Path,
+    init_program_source: Path,
+    message_sizes: Iterable[int],
+) -> tuple[dict, list[dict[str, str]]]:
+  base_dir = bundle_root / scale.experiment_rel
+  topodsl_dir = base_dir / "topodsl"
+  config_dir = base_dir / "flow-sim-configs"
+  instruction_dir = base_dir / "instructions"
+  init_dir = base_dir / "init_programs"
+  output_dir = base_dir / "outputs"
+  log_dir = base_dir / "logs"
+  for directory in (topodsl_dir, config_dir, instruction_dir, init_dir, output_dir, log_dir):
+    directory.mkdir(parents=True, exist_ok=True)
+
+  init_program_path = write_init_program(
+      init_program_source,
+      init_dir / "init_program.py",
+      gpu_num=scale.total_gpus,
+  )
+  case_records = []
+  run_records = []
+  for case in build_case_specs(scale, message_sizes):
+    topodsl_path = topodsl_dir / f"{case.name}-topodsl.py"
+    topodsl_path.write_text(render_topodsl(case, topology_template, scale), encoding="utf-8")
+    topo = load_topodsl(topodsl_path)
+    if total_gpus(topo) != scale.total_gpus:
+      raise ValueError(f"TopoDSL {topodsl_path} did not resolve to {scale.total_gpus} GPUs")
+    if topo.params.message_size != case.config_coll_byte:
+      raise ValueError(
+          f"TopoDSL {topodsl_path} resolved coll.byte={topo.params.message_size}, "
+          f"expected {case.config_coll_byte}"
+      )
+
+    config_path = config_dir / f"{case.name}-config.json"
+    config_path.write_text(
+        json.dumps(build_resimulation_config(case, resimulation_config_template, scale), indent=2),
+        encoding="utf-8",
+    )
+    case_instruction_dir = instruction_dir / case.name
+    case_instruction_dir.mkdir(parents=True, exist_ok=True)
+    instruction_path = case_instruction_dir / "syccl_instruction.txt"
+    instruction_path.write_text(render_instruction(topo, resolved_instruction_template), encoding="utf-8")
+
+    case_record = {
+        "case": case.name,
+        "total_message_size": case.total_message_size,
+        "config_coll_byte": case.config_coll_byte,
+        "topodsl_path": str(topodsl_path),
+        "config_path": str(config_path),
+        "instruction_path": str(instruction_path),
+        "init_program_path": str(init_program_path),
+    }
+    case_records.append(case_record)
+    for strategy in STRATEGIES:
+      run_record = {
+          "scale": scale.name,
+          "case_id": f"{scale.name}/{case.name}",
+          "case": case.name,
+          "strategy": strategy,
+          "config_path": str(config_path),
+          "instruction_path": str(instruction_path),
+          "init_program_path": str(init_program_path),
+          "output_path": str(output_dir / strategy / case.name / "checkpoints"),
+          "artifact_dir": str(output_dir / strategy / case.name / "eval_artifacts"),
+          "log_path": str(log_dir / strategy / f"{case.name}.log"),
+          "topodsl_path": str(topodsl_path),
+      }
+      run_records.append(run_record)
+
+  scale_manifest_path = base_dir / "manifest.json"
+  scale_record = {
+      "name": scale.name,
+      "experiment": str(scale.experiment_rel),
+      "hosts": scale.hosts,
+      "gpus_per_host": scale.gpus_per_host,
+      "nics_per_host": scale.nics_per_host,
+      "leaf_switches": scale.leaf_switches,
+      "spine_switches": scale.spine_switches,
+      "total_gpus": scale.total_gpus,
+      "collective": "allgather",
+      "manifest_path": str(scale_manifest_path),
+      "cases": case_records,
+      "runs": run_records,
+  }
+  scale_manifest_path.write_text(json.dumps(scale_record, indent=2), encoding="utf-8")
+  return scale_record, run_records
 
 
 def prepare_experiment(
@@ -479,6 +615,9 @@ def prepare_experiment(
     flow_sim_bin: Path | None = None,
     message_sizes: Iterable[int] = TOTAL_MESSAGE_SIZES,
 ) -> Path:
+  bundle_root = output_root.expanduser().resolve()
+  bundle_root.mkdir(parents=True, exist_ok=True)
+  message_sizes = tuple(int(size) for size in message_sizes)
   resolved_template_dir = resolve_template_dir(template_dir)
   resolved_instruction_template = instruction_template.expanduser().resolve()
   if not resolved_instruction_template.is_file():
@@ -494,7 +633,6 @@ def prepare_experiment(
   with resimulation_config_template_path.open("r", encoding="utf-8") as f:
     resimulation_config_template = json.load(f)
 
-  base_dir = output_root.expanduser().resolve() / EXPERIMENT_REL
   source_flow_sim_bin = (
       flow_sim_bin.expanduser().resolve()
       if flow_sim_bin is not None
@@ -502,84 +640,30 @@ def prepare_experiment(
   )
   if not source_flow_sim_bin.is_file():
     raise FileNotFoundError(f"flow-sim-rs binary not found: {source_flow_sim_bin}")
-  resolved_flow_sim_bin = (base_dir / "bin" / "flow-sim-rs").resolve()
-  topodsl_dir = base_dir / "topodsl"
-  config_dir = base_dir / "flow-sim-configs"
-  instruction_dir = base_dir / "instructions"
-  init_dir = base_dir / "init_programs"
-  output_dir = base_dir / "outputs"
-  log_dir = base_dir / "logs"
-
-  for directory in (topodsl_dir, config_dir, instruction_dir, init_dir, output_dir, log_dir, resolved_flow_sim_bin.parent):
-    directory.mkdir(parents=True, exist_ok=True)
+  resolved_flow_sim_bin = bundle_root / "bin" / "flow-sim-rs"
+  resolved_flow_sim_bin.parent.mkdir(parents=True, exist_ok=True)
   if source_flow_sim_bin != resolved_flow_sim_bin:
     shutil.copy2(source_flow_sim_bin, resolved_flow_sim_bin)
   resolved_flow_sim_bin.chmod(0o755)
 
-  init_program_path = write_init_program(
-      init_program_source,
-      init_dir / "init_program.py",
-      gpu_num=TOTAL_GPUS,
-  )
-
-  case_records = []
+  scale_records = []
   run_records = []
-  task_rows = []
-
-  for case in build_case_specs(message_sizes):
-    topodsl_path = topodsl_dir / f"{case.name}-topodsl.py"
-    topodsl_path.write_text(render_topodsl(case, topology_template), encoding="utf-8")
-    topo = load_topodsl(topodsl_path)
-    if total_gpus(topo) != TOTAL_GPUS:
-      raise ValueError(f"TopoDSL {topodsl_path} did not resolve to {TOTAL_GPUS} GPUs")
-    if topo.params.message_size != case.config_coll_byte:
-      raise ValueError(
-          f"TopoDSL {topodsl_path} resolved coll.byte={topo.params.message_size}, "
-          f"expected {case.config_coll_byte}"
-      )
-
-    config_path = config_dir / f"{case.name}-config.json"
-    config_path.write_text(
-        json.dumps(build_resimulation_config(case, resimulation_config_template), indent=2),
-        encoding="utf-8",
+  for scale in SCALE_SPECS:
+    scale_record, scale_runs = prepare_scale_inputs(
+        scale=scale,
+        bundle_root=bundle_root,
+        topology_template=topology_template,
+        resimulation_config_template=resimulation_config_template,
+        resolved_instruction_template=resolved_instruction_template,
+        init_program_source=init_program_source,
+        message_sizes=message_sizes,
     )
-
-    case_instruction_dir = instruction_dir / case.name
-    case_instruction_dir.mkdir(parents=True, exist_ok=True)
-    instruction_path = case_instruction_dir / "syccl_instruction.txt"
-    instruction_path.write_text(render_instruction(topo, resolved_instruction_template), encoding="utf-8")
-
-    case_record = {
-        "case": case.name,
-        "total_message_size": case.total_message_size,
-        "config_coll_byte": case.config_coll_byte,
-        "topodsl_path": str(topodsl_path),
-        "config_path": str(config_path),
-        "instruction_path": str(instruction_path),
-        "init_program_path": str(init_program_path),
-    }
-    case_records.append(case_record)
-    for strategy in STRATEGIES:
-      run_output = output_dir / strategy / case.name / "checkpoints"
-      artifact_dir = output_dir / strategy / case.name / "eval_artifacts"
-      log_path = log_dir / strategy / f"{case.name}.log"
-      run_record = {
-          "case": case.name,
-          "strategy": strategy,
-          "config_path": str(config_path),
-          "instruction_path": str(instruction_path),
-          "init_program_path": str(init_program_path),
-          "output_path": str(run_output),
-          "artifact_dir": str(artifact_dir),
-          "log_path": str(log_path),
-          "topodsl_path": str(topodsl_path),
-      }
-      run_records.append(run_record)
-      task_rows.append(run_record)
+    scale_records.append(scale_record)
+    run_records.extend(scale_runs)
 
   write_run_scripts(
-      base_dir,
-      task_rows,
+      bundle_root,
+      run_records,
       max_parallel=max_parallel,
       max_generations=max_generations,
       k_candidates=k_candidates,
@@ -591,13 +675,7 @@ def prepare_experiment(
   )
 
   manifest = {
-      "experiment": str(EXPERIMENT_REL),
-      "hosts": HOSTS,
-      "gpus_per_host": GPUS_PER_HOST,
-      "nics_per_host": NICS_PER_HOST,
-      "leaf_switches": LEAF_SWITCHES,
-      "spine_switches": SPINE_SWITCHES,
-      "total_gpus": TOTAL_GPUS,
+      "experiment": bundle_experiment_id(),
       "collective": "allgather",
       "strategies": list(STRATEGIES),
       "max_parallel": max_parallel,
@@ -610,24 +688,24 @@ def prepare_experiment(
       "flow_sim_bin": str(resolved_flow_sim_bin),
       "flow_sim_source": str(source_flow_sim_bin),
       "openai_api_key_default": "sk-nokey",
-      "total_message_sizes": [case["total_message_size"] for case in case_records],
+      "total_message_sizes": list(message_sizes),
       "template_dir": str(resolved_template_dir),
       "topology_template": str(topology_template_path),
       "resimulation_config_template": str(resimulation_config_template_path),
       "init_program_source": str(init_program_source),
       "instruction_template": str(resolved_instruction_template),
-      "cases": case_records,
+      "scales": scale_records,
       "runs": run_records,
   }
-  manifest_path = base_dir / "manifest.json"
+  manifest_path = bundle_root / "manifest.json"
   manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
   write_start_commands(
-      output_root.expanduser().resolve(),
-      base_dir,
+      bundle_root,
       model=model,
       api_base=api_base,
       max_tokens=max_tokens,
-      task_count=len(task_rows),
+      task_count=len(run_records),
+      scales=SCALE_SPECS,
   )
   return manifest_path
 
