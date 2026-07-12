@@ -1,0 +1,6 @@
+{
+  "status": "ok",
+  "source_path": "/root/llm-ccl/agent/datasets/syccl/scheme1_direct_events/flow-sim-rs/target/release/flow-sim-rs",
+  "bundle_path": "/root/llm-ccl/experiments/v100-dgx2-clos/20260712-125527/bin/flow-sim-rs",
+  "sha256": "8263dc91c3c8ed79f3834eefed2a6c03f2322e9dcae6bcb0a8f619e8e1282f88"
+}
