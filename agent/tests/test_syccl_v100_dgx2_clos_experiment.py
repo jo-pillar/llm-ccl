@@ -26,7 +26,11 @@ class SycclV100ClosExperimentTest(unittest.TestCase):
     four_host_cases = script.build_case_specs(four_host)
     eight_host_cases = script.build_case_specs(eight_host)
 
-    self.assertRegex(str(script.DEFAULT_OUTPUT_ROOT), r"/result/search/v100-dgx2-clos-\d{8}T\d{6}Z$")
+    self.assertEqual(
+        script.REPO_ROOT / "experiments" / "v100-dgx2-clos",
+        script.DEFAULT_OUTPUT_ROOT.parent,
+    )
+    self.assertRegex(str(script.DEFAULT_OUTPUT_ROOT), r"/experiments/v100-dgx2-clos/\d{8}-\d{6}$")
 
     total_sizes = [
         65536,

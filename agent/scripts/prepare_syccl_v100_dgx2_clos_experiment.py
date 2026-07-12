@@ -15,6 +15,7 @@ from typing import Iterable, NamedTuple
 
 
 AGENT_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = AGENT_ROOT.parent
 if str(AGENT_ROOT) not in sys.path:
   sys.path.insert(0, str(AGENT_ROOT))
 
@@ -25,10 +26,10 @@ DATASET_ROOT = AGENT_ROOT / "datasets" / "syccl" / "scheme1_direct_events"
 DEFAULT_TEMPLATE_DIR = DATASET_ROOT / "templates" / "v100_dgx2_clos"
 DEFAULT_INSTRUCTION_TEMPLATE = DEFAULT_TEMPLATE_DIR / "prompt_template.txt"
 DEFAULT_OUTPUT_ROOT = (
-    AGENT_ROOT
-    / "result"
-    / "search"
-    / f"v100-dgx2-clos-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    REPO_ROOT
+    / "experiments"
+    / "v100-dgx2-clos"
+    / f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
 )
 DEFAULT_FLOW_SIM_BIN = DATASET_ROOT / "flow-sim-rs" / "target" / "release" / "flow-sim-rs"
 TOPOLOGY_TEMPLATE_NAME = "clos_topo.py"
