@@ -1,0 +1,12 @@
+{
+  "worktree": "/root/origin-syccl-h800-855a184",
+  "target_commit": "855a184ed0746b46595763661345d76812c9a7dd",
+  "head": "855a184ed0746b46595763661345d76812c9a7dd",
+  "dirty_status": "M scripts/runexp.py\n M scripts/runexp_reverse.py\n M scripts/runexp_scale.py",
+  "source_synthesize_path": "/root/origin-syccl-h800-855a184/build/synthesize",
+  "synthesize_path": "/root/llm-ccl/experiments/v100-dgx2-clos/20260712-125527/bin/origin-syccl-synthesize",
+  "synthesize_exists": true,
+  "synthesize_sha256": "2e2ad9d5b2251617be8b4089bf7248e02af9c588cdb125b3cacabca81d241b18",
+  "expected_synthesize_sha256": "2e2ad9d5b2251617be8b4089bf7248e02af9c588cdb125b3cacabca81d241b18",
+  "source_verified": true
+}
