@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import runpy
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -81,12 +82,107 @@ class SycclV100ClosExperimentTest(unittest.TestCase):
         self.assertEqual(("12.5GB/s", "25us"), links[(f"nic[{scale.hosts - 1}]", f"leaf[{scale.leaf_switches - 1}]")])
         self.assertEqual(("400GB/s", "25us"), links[(f"leaf[{scale.leaf_switches - 1}]", "spine[0]")])
 
+  def test_origin_source_and_generated_script_values_are_pinned(self):
+    script = load_script()
+    with tempfile.TemporaryDirectory(prefix="v100_origin_source_") as tmp:
+      worktree = Path(tmp) / "origin-syccl"
+      synthesize = worktree / "build" / "synthesize"
+      synthesize.parent.mkdir(parents=True)
+      synthesize.write_bytes(b"pinned-synthesize")
+      subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
+      subprocess.run(["git", "add", "build/synthesize"], cwd=worktree, check=True)
+      subprocess.run(
+          [
+              "git",
+              "-c",
+              "user.name=V100 Test",
+              "-c",
+              "user.email=v100-test@example.invalid",
+              "commit",
+              "-q",
+              "-m",
+              "pin source",
+          ],
+          cwd=worktree,
+          check=True,
+      )
+      head = subprocess.run(
+          ["git", "rev-parse", "HEAD"],
+          cwd=worktree,
+          check=True,
+          stdout=subprocess.PIPE,
+          text=True,
+      ).stdout.strip()
+      sha256 = script.sha256_file(synthesize)
+
+      self.assertEqual((head, sha256), script.verify_origin_syccl(
+          worktree,
+          synthesize,
+          expected_commit=head,
+          expected_synthesize_sha256=sha256,
+      ))
+      with self.assertRaisesRegex(ValueError, "HEAD mismatch"):
+        script.verify_origin_syccl(
+            worktree,
+            synthesize,
+            expected_commit="0" * 40,
+            expected_synthesize_sha256=sha256,
+        )
+      with self.assertRaisesRegex(ValueError, "sha256 mismatch"):
+        script.verify_origin_syccl(
+            worktree,
+            synthesize,
+            expected_commit=head,
+            expected_synthesize_sha256="0" * 64,
+        )
+      with self.assertRaisesRegex(ValueError, "unsafe bundle path"):
+        script.validate_generated_script_value(
+            '/tmp/bundle"injected',
+            label="bundle path",
+            pattern=r"[A-Za-z0-9_./=-]+",
+        )
+
   def test_prepare_experiment_writes_combined_four_and_eight_host_bundle(self):
     script = load_script()
     with tempfile.TemporaryDirectory(prefix="syccl_v100_dgx2_clos_exp_") as tmp:
       output_root = Path(tmp) / "result" / "search" / "v100-dgx2-clos-test"
+      syccl_worktree = Path(tmp) / "origin-syccl"
+      synthesize_bin = syccl_worktree / "build" / "synthesize"
+      synthesize_bin.parent.mkdir(parents=True)
+      synthesize_bin.write_bytes(b"test-synthesize")
+      synthesize_bin.chmod(0o755)
+      subprocess.run(["git", "init", "-q"], cwd=syccl_worktree, check=True)
+      subprocess.run(["git", "add", "build/synthesize"], cwd=syccl_worktree, check=True)
+      subprocess.run(
+          [
+              "git",
+              "-c",
+              "user.name=V100 Test",
+              "-c",
+              "user.email=v100-test@example.invalid",
+              "commit",
+              "-q",
+              "-m",
+              "test synthesize",
+          ],
+          cwd=syccl_worktree,
+          check=True,
+      )
+      syccl_commit = subprocess.run(
+          ["git", "rev-parse", "HEAD"],
+          cwd=syccl_worktree,
+          check=True,
+          stdout=subprocess.PIPE,
+          text=True,
+      ).stdout.strip()
+      synthesize_sha256 = script.sha256_file(synthesize_bin)
 
-      manifest_path = script.prepare_experiment(output_root=output_root)
+      manifest_path = script.prepare_experiment(
+          output_root=output_root,
+          syccl_worktree=syccl_worktree,
+          syccl_commit=syccl_commit,
+          synthesize_sha256=synthesize_sha256,
+      )
 
       manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
       self.assertEqual(output_root / "manifest.json", manifest_path)
@@ -107,6 +203,19 @@ class SycclV100ClosExperimentTest(unittest.TestCase):
       self.assertEqual("sk-nokey", manifest["openai_api_key_default"])
       self.assertEqual(2, len(manifest["scales"]))
       self.assertEqual(72, len(manifest["runs"]))
+      self.assertEqual(24, manifest["case_count"])
+      self.assertEqual(72, manifest["llm_task_count"])
+      self.assertEqual(24, manifest["origin_task_count"])
+      self.assertEqual("10h", manifest["origin_timeout"])
+      self.assertEqual(str(syccl_worktree), manifest["syccl"]["worktree"])
+      self.assertEqual(syccl_commit, manifest["syccl"]["head"])
+      bundled_synthesize = output_root / "bin" / "origin-syccl-synthesize"
+      self.assertEqual(str(synthesize_bin), manifest["syccl"]["source_synthesize_path"])
+      self.assertEqual(str(bundled_synthesize), manifest["syccl"]["synthesize_path"])
+      self.assertEqual(synthesize_bin.read_bytes(), bundled_synthesize.read_bytes())
+      self.assertTrue(manifest["syccl"]["synthesize_exists"])
+      self.assertEqual(synthesize_sha256, manifest["syccl"]["synthesize_sha256"])
+      self.assertTrue(manifest["syccl"]["source_verified"])
 
       for scale_record, expected_hosts, expected_gpus, expected_first_byte, expected_last_byte in (
           (manifest["scales"][0], 4, 64, 1024, 4294967296),
@@ -135,6 +244,14 @@ class SycclV100ClosExperimentTest(unittest.TestCase):
         self.assertEqual(25, first_config["link_spec"]["netlink_leaf"]["lat_us"])
         self.assertEqual(0.4, first_config["link_spec"]["netlink_spine"]["bw_mbpus"])
         self.assertEqual(25, first_config["link_spec"]["netlink_spine"]["lat_us"])
+        self.assertEqual(1, first_config["solver"]["split_chunks"])
+        self.assertEqual([0, 2], first_config["prune"]["ignored_layers"])
+        self.assertEqual([1, 3, 4], first_config["prune"]["must_contain_layers"])
+        self.assertEqual(first["origin_result_path"], first_config["algo_solve"]["solve_output"])
+        self.assertEqual(first["origin_sketch_path"], first_config["sketch"]["sketch_path"])
+        self.assertTrue(first_config["sketch"]["save_sketch"])
+        self.assertTrue(first["config_sha256"])
+        self.assertTrue(first["config_semantic_sha256"])
 
         last_config = json.loads(Path(scale_record["cases"][-1]["config_path"]).read_text(encoding="utf-8"))
         self.assertEqual(expected_last_byte, last_config["coll"]["byte"])
@@ -158,6 +275,17 @@ class SycclV100ClosExperimentTest(unittest.TestCase):
       self.assertEqual(9, len(tasks[0].split("\t")))
       self.assertTrue(tasks[0].startswith("4hosts-64gpu/64k-total\t"))
       self.assertTrue(tasks[36].startswith("8hosts-128gpu/64k-total\t"))
+      self.assertIn("/llm/outputs/", tasks[0])
+
+      origin_tasks = (manifest_path.parent / "runs" / "origin_tasks.tsv").read_text(encoding="utf-8").splitlines()
+      self.assertEqual(24, len(origin_tasks))
+      self.assertEqual(4, len(origin_tasks[0].split("\t")))
+      self.assertTrue(origin_tasks[0].startswith("4hosts-64gpu/64k-total\t"))
+
+      config_manifest = json.loads(
+          (manifest_path.parent / "configs" / "manifest.json").read_text(encoding="utf-8")
+      )
+      self.assertEqual(24, len(config_manifest["cases"]))
 
       run_one = (manifest_path.parent / "runs" / "run_one.sh").read_text(encoding="utf-8")
       self.assertIn('SIMPLETES_TIMEOUT="${SIMPLETES_TIMEOUT:-2h}"', run_one)
@@ -188,11 +316,54 @@ class SycclV100ClosExperimentTest(unittest.TestCase):
       run_all = (manifest_path.parent / "runs" / "run_all.sh").read_text(encoding="utf-8")
       self.assertIn('xargs -P "${LLM_MAX_PARALLEL:-2}" -n 9', run_all)
 
+      run_llm_all = (manifest_path.parent / "runs" / "run_llm_all.sh").read_text(encoding="utf-8")
+      self.assertIn('exec "$SCRIPT_DIR/run_all.sh"', run_llm_all)
+
+      run_origin_one = (manifest_path.parent / "runs" / "run_origin_one.sh").read_text(encoding="utf-8")
+      self.assertIn('ORIGIN_SOLVE_TIMEOUT="${ORIGIN_SOLVE_TIMEOUT:-10h}"', run_origin_one)
+      self.assertIn(str(bundled_synthesize), run_origin_one)
+      self.assertNotIn("${SYNTHESIZE_BIN:-", run_origin_one)
+
+      run_origin_all = (manifest_path.parent / "runs" / "run_origin_all.sh").read_text(encoding="utf-8")
+      self.assertIn("run_origin_solve_all.py", run_origin_all)
+
+      generated_python = (
+          "run_origin_solve_all.py",
+          "run_origin_flow_sim_all.py",
+          "summarize_llm_outputs.py",
+          "build_final_report.py",
+      )
+      for name in generated_python:
+        source = (manifest_path.parent / "runs" / name).read_text(encoding="utf-8")
+        compile(source, name, "exec")
+      self.assertIn(
+          str(bundled_synthesize),
+          (manifest_path.parent / "runs" / "run_origin_solve_all.py").read_text(encoding="utf-8"),
+      )
+      self.assertNotIn(
+          'os.environ.get("SYNTHESIZE_BIN"',
+          (manifest_path.parent / "runs" / "run_origin_solve_all.py").read_text(encoding="utf-8"),
+      )
+
+      runpy.run_path(manifest_path.parent / "runs" / "run_origin_flow_sim_all.py")
+      runpy.run_path(manifest_path.parent / "runs" / "summarize_llm_outputs.py")
+      runpy.run_path(manifest_path.parent / "runs" / "build_final_report.py")
+      report = json.loads(
+          (manifest_path.parent / "reports" / "main_case_summary.json").read_text(encoding="utf-8")
+      )
+      self.assertEqual(24, len(report))
+      self.assertEqual("missing", report[0]["llm_status"])
+      self.assertEqual("missing", report[0]["origin_status"])
+
       start_commands = (output_root / "START_COMMANDS.md").read_text(encoding="utf-8")
       self.assertIn("V100 DGX-2 Clos Search Launch Commands", start_commands)
-      self.assertIn(str(manifest_path.parent / "runs" / "run_all.sh"), start_commands)
+      self.assertIn(str(manifest_path.parent / "runs" / "run_llm_all.sh"), start_commands)
       self.assertIn("API_BASE=http://127.0.0.1:8000/v1", start_commands)
-      self.assertIn("72 tasks", start_commands)
+      self.assertIn("72 llm-ccl tasks", start_commands)
+      self.assertIn("24 origin-SyCCL tasks", start_commands)
+      self.assertIn(str(manifest_path.parent / "runs" / "run_origin_all.sh"), start_commands)
+      self.assertIn(str(manifest_path.parent / "runs" / "run_origin_flow_sim_all.py"), start_commands)
+      self.assertIn(str(manifest_path.parent / "runs" / "build_final_report.py"), start_commands)
       self.assertIn("4-host and 8-host", start_commands)
 
 
