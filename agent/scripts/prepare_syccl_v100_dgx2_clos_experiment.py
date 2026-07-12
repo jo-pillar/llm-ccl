@@ -169,8 +169,8 @@ def render_topodsl(case: CaseSpec, template_text: str, scale: ScaleSpec) -> str:
     {case.total_message_size},
     CollectiveType.ALLGATHER,
     layer1=LayerSpec(1, LinkSpec("125GB/s", "3us"), group_num={scale.hosts}, node_num={scale.gpus_per_host}, node_type=NodeType.GPU),
-    layer2=LayerSpec(2, LinkSpec("400GB/s", "0us"), group_num={scale.hosts}, node_num={scale.nics_per_host}, node_type=NodeType.NIC),
-    layer3=LayerSpec(3, LinkSpec("400GB/s", "25us"), group_num={scale.leaf_switches}, node_num={scale.hosts // scale.leaf_switches}, node_type=NodeType.SWITCH),
+    layer2=LayerSpec(2, LinkSpec("12.5GB/s", "0us"), group_num={scale.hosts}, node_num={scale.nics_per_host}, node_type=NodeType.NIC),
+    layer3=LayerSpec(3, LinkSpec("12.5GB/s", "25us"), group_num={scale.leaf_switches}, node_num={scale.hosts // scale.leaf_switches}, node_type=NodeType.SWITCH),
     layer4=LayerSpec(4, LinkSpec("400GB/s", "25us"), group_num={scale.spine_switches}, node_num={scale.leaf_switches}, node_type=NodeType.SWITCH),
 )
 '''
@@ -208,8 +208,8 @@ def build_resimulation_config(case: CaseSpec, template_config: dict, scale: Scal
   _set_switch_num(config, layer_id=3, switch_num=scale.leaf_switches)
   _set_switch_num(config, layer_id=4, switch_num=scale.spine_switches)
   config["link_spec"]["nvswitch"] = {"bw_mbpus": 0.125, "lat_us": 3}
-  config["link_spec"]["link_nic"] = {"bw_mbpus": 0.4, "lat_us": 0}
-  config["link_spec"]["netlink_leaf"] = {"bw_mbpus": 0.4, "lat_us": 25}
+  config["link_spec"]["link_nic"] = {"bw_mbpus": 0.0125, "lat_us": 0}
+  config["link_spec"]["netlink_leaf"] = {"bw_mbpus": 0.0125, "lat_us": 25}
   config["link_spec"]["netlink_spine"] = {"bw_mbpus": 0.4, "lat_us": 25}
   config["sketch"] = {
       "customize_sketch": False,
