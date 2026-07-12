@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufReader, Read};
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -195,6 +199,164 @@ pub fn to_syccl_resim_input(
             }
         }]
     }))
+}
+
+#[derive(Serialize)]
+struct SycclSendOutput {
+    src_gpu: usize,
+    dst_gpu: usize,
+    epoch: u64,
+    copy: bool,
+    reduce: bool,
+    layer_used: i64,
+}
+
+pub fn write_syccl_resim_input<W: Write>(
+    schedule: &TranslatedSchedule,
+    config: &SimConfig,
+    mut writer: W,
+) -> Result<()> {
+    let chunk_size_byte = schedule.chunk_size_byte.unwrap_or(config.coll_bytes);
+    let total_gpus = config.hosts.host_num * config.hosts.gpus_per_host;
+    if schedule.ngpus != total_gpus {
+        return Err(anyhow!(
+            "translated schedule ngpus {} does not match config topology {}",
+            schedule.ngpus,
+            total_gpus
+        ));
+    }
+    if schedule
+        .coll_name
+        .as_deref()
+        .is_some_and(|name| name != config.coll_name)
+    {
+        return Err(anyhow!(
+            "translated schedule collective {:?} does not match config collective {}",
+            schedule.coll_name,
+            config.coll_name
+        ));
+    }
+
+    let chunk_keys = syccl_resim_chunk_keys(schedule, config)?;
+    let mut sends_by_chunk: BTreeMap<(usize, usize), Vec<&SendEvent>> = BTreeMap::new();
+    for send in &schedule.sends {
+        sends_by_chunk
+            .entry((send.src_chunk, send.chunk_index))
+            .or_default()
+            .push(send);
+    }
+    for sends in sends_by_chunk.values_mut() {
+        sends.sort_by_key(|send| (send.epoch, send.order));
+    }
+
+    writer.write_all(b"{\"coll_name\":")?;
+    serde_json::to_writer(&mut writer, &config.coll_name)?;
+    writer.write_all(b",\"ngpus\":")?;
+    serde_json::to_writer(&mut writer, &schedule.ngpus)?;
+    writer.write_all(b",\"chunk_size_byte\":")?;
+    serde_json::to_writer(&mut writer, &chunk_size_byte)?;
+    writer.write_all(b",\"algorithms\":[{\"chunk_size_B\":")?;
+    serde_json::to_writer(&mut writer, &chunk_size_byte)?;
+    writer.write_all(b",\"final_schedule\":{\"Schedule\":{\"init_devs\":[")?;
+
+    for (index, (src_chunk, chunk_index)) in chunk_keys.iter().copied().enumerate() {
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        let chunk_key = [src_chunk, chunk_index];
+        let devices = [syccl_gpu_device_id(src_chunk, config)?];
+        serde_json::to_writer(&mut writer, &(&chunk_key, &devices))?;
+    }
+
+    writer.write_all(b"],\"chunk_sizes\":[")?;
+    for (index, (src_chunk, chunk_index)) in chunk_keys.iter().copied().enumerate() {
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        let chunk_key = [src_chunk, chunk_index];
+        serde_json::to_writer(&mut writer, &(&chunk_key, chunk_size_byte))?;
+    }
+
+    writer.write_all(b"],\"Events\":[")?;
+    for (event_index, ((src_chunk, chunk_index), sends)) in sends_by_chunk.into_iter().enumerate() {
+        if event_index > 0 {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(b"{\"src_chunk\":")?;
+        serde_json::to_writer(&mut writer, &format!("({}, {})", src_chunk, chunk_index))?;
+        writer.write_all(b",\"sends\":[")?;
+        for (send_index, send) in sends.into_iter().enumerate() {
+            if send_index > 0 {
+                writer.write_all(b",")?;
+            }
+            serde_json::to_writer(
+                &mut writer,
+                &SycclSendOutput {
+                    src_gpu: send.src_gpu,
+                    dst_gpu: send.dst_gpu,
+                    epoch: send.epoch,
+                    copy: true,
+                    reduce: false,
+                    layer_used: send.layer_used.unwrap_or(-1),
+                },
+            )?;
+        }
+        writer.write_all(b"]}")?;
+    }
+    writer.write_all(b"]}}}]}")?;
+    Ok(())
+}
+
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub fn write_syccl_resim_input_atomic(
+    schedule: &TranslatedSchedule,
+    config: &SimConfig,
+    output: &Path,
+) -> Result<()> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let temporary = atomic_temporary_path(output)?;
+
+    let result = (|| {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        let mut writer = BufWriter::new(file);
+        write_syccl_resim_input(schedule, config, &mut writer)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        fs::rename(&temporary, output).with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                output.display(),
+                temporary.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn atomic_temporary_path(output: &Path) -> Result<PathBuf> {
+    let file_name = output
+        .file_name()
+        .ok_or_else(|| anyhow!("output path has no file name: {}", output.display()))?;
+    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temporary_name = OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+    Ok(output.with_file_name(temporary_name))
 }
 
 fn syccl_resim_chunk_keys(

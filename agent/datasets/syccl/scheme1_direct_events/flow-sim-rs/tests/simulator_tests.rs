@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -7,7 +8,10 @@ use flow_sim_rs::{
     batch_sketch::{build_sketch_manifest, run_sketch_batch},
     compare::compare_manifest,
     config::{parse_config, spec_to_bps, spec_to_ns},
-    schedule::{build_flows, parse_all_translated_schedules, parse_translated_schedule},
+    schedule::{
+        build_flows, parse_all_translated_schedules, parse_translated_schedule,
+        to_syccl_resim_input, write_syccl_resim_input, write_syccl_resim_input_atomic,
+    },
     simulator::{simulate_case, LinkKey, RouteKind},
     sketch::{parse_compact_sketches, sketches_to_translated_schedule},
     topology::Topology,
@@ -77,6 +81,20 @@ fn alltoall_config() -> &'static str {
     fixture_config()
         .replace("\"allgather\"", "\"alltoall\"")
         .leak()
+}
+
+fn alltoall_round_robin_config() -> String {
+    queue_config().replace("\"allgather\"", "\"alltoall\"")
+}
+
+fn alltoall_round_robin_sketch() -> &'static str {
+    r#"[
+      [
+        [0, 1, 0, 0, 1],
+        [0, 3, 0, 0, [2, 4]],
+        [1, 3, 1, 1, [3, 5]]
+      ]
+    ]"#
 }
 
 fn alltoall_translated() -> &'static str {
@@ -655,6 +673,212 @@ fn compact_sketch_expands_and_simulates_without_translated_file() {
 }
 
 #[test]
+fn alltoall_sketch_assigns_unique_remote_source_and_destination_rounds() {
+    let config_json = alltoall_round_robin_config();
+    let config = parse_config(config_json.as_bytes()).unwrap();
+    let sketches =
+        parse_compact_sketches(alltoall_round_robin_sketch().as_bytes(), &config).unwrap();
+    let schedule = sketches_to_translated_schedule(&sketches, &config).unwrap();
+    let mut source_rounds = BTreeSet::new();
+    let mut destination_rounds = BTreeSet::new();
+    let mut epochs = BTreeSet::new();
+    let mut remote_sends = 0;
+
+    for send in schedule
+        .sends
+        .iter()
+        .filter(|send| send.src_gpu / 2 != send.dst_gpu / 2)
+    {
+        remote_sends += 1;
+        epochs.insert(send.epoch);
+        assert!(
+            source_rounds.insert((send.epoch, send.src_gpu)),
+            "source GPU {} has multiple remote sends in epoch {}",
+            send.src_gpu,
+            send.epoch
+        );
+        assert!(
+            destination_rounds.insert((send.epoch, send.dst_gpu)),
+            "destination GPU {} has multiple remote sends in epoch {}",
+            send.dst_gpu,
+            send.epoch
+        );
+    }
+
+    assert_eq!(remote_sends, 24);
+    assert_eq!(epochs, BTreeSet::from([0, 1, 2, 3]));
+}
+
+#[test]
+fn alltoall_sketch_keeps_two_hop_routes_in_one_round() {
+    let config_json = alltoall_round_robin_config();
+    let config = parse_config(config_json.as_bytes()).unwrap();
+    let sketches =
+        parse_compact_sketches(alltoall_round_robin_sketch().as_bytes(), &config).unwrap();
+    let schedule = sketches_to_translated_schedule(&sketches, &config).unwrap();
+    let mut sends_by_chunk = BTreeMap::new();
+
+    for send in &schedule.sends {
+        sends_by_chunk
+            .entry((send.src_chunk, send.chunk_index))
+            .or_insert_with(Vec::new)
+            .push(send);
+    }
+
+    assert_eq!(schedule.sends.len(), 42);
+    assert_eq!(
+        sends_by_chunk
+            .values()
+            .filter(|sends| sends.len() == 2)
+            .count(),
+        12
+    );
+    for sends in sends_by_chunk.values().filter(|sends| sends.len() == 2) {
+        assert_eq!(sends[0].src_gpu / 2, sends[0].dst_gpu / 2);
+        assert_ne!(sends[1].src_gpu / 2, sends[1].dst_gpu / 2);
+        assert_eq!(sends[0].epoch, sends[1].epoch);
+    }
+
+    let actual: BTreeMap<_, usize> =
+        schedule
+            .sends
+            .iter()
+            .fold(BTreeMap::new(), |mut counts, send| {
+                *counts
+                    .entry((
+                        send.src_chunk,
+                        send.chunk_index,
+                        send.src_gpu,
+                        send.dst_gpu,
+                        send.layer_used,
+                    ))
+                    .or_default() += 1;
+                counts
+            });
+    let mut expected = BTreeMap::new();
+    for src in 0..6 {
+        for dst in 0..6 {
+            if src == dst {
+                continue;
+            }
+            let src_host = src / 2;
+            let dst_host = dst / 2;
+            if src_host == dst_host {
+                *expected.entry((src, dst, src, dst, Some(1))).or_default() += 1;
+            } else if src % 2 == dst % 2 {
+                *expected.entry((src, dst, src, dst, Some(3))).or_default() += 1;
+            } else {
+                let proxy = src_host * 2 + dst % 2;
+                *expected.entry((src, dst, src, proxy, Some(1))).or_default() += 1;
+                *expected.entry((src, dst, proxy, dst, Some(3))).or_default() += 1;
+            }
+        }
+    }
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn alltoall_sketch_prioritizes_remote_rounds_before_same_host_completion() {
+    let config_json = alltoall_round_robin_config();
+    let config = parse_config(config_json.as_bytes()).unwrap();
+    let sketches =
+        parse_compact_sketches(alltoall_round_robin_sketch().as_bytes(), &config).unwrap();
+    let schedule = sketches_to_translated_schedule(&sketches, &config).unwrap();
+    let remote_max = schedule
+        .sends
+        .iter()
+        .filter(|send| send.src_gpu / 2 != send.dst_gpu / 2)
+        .map(|send| send.epoch)
+        .max()
+        .unwrap();
+
+    for send in schedule.sends.iter().filter(|send| {
+        send.src_gpu / 2 == send.dst_gpu / 2 && send.src_chunk / 2 == send.chunk_index / 2
+    }) {
+        assert!(send.epoch > remote_max);
+    }
+}
+
+#[test]
+fn sketch_expansion_is_deterministic_for_allgather_and_alltoall() {
+    for (config_json, sketch_json) in [
+        (
+            fixture_config().to_string(),
+            r#"[
+              [
+                [0, 1, 0, 0, 1],
+                [0, 3, 0, 0, 2],
+                [1, 1, 1, 2, 3]
+              ]
+            ]"#,
+        ),
+        (alltoall_round_robin_config(), alltoall_round_robin_sketch()),
+    ] {
+        let config = parse_config(config_json.as_bytes()).unwrap();
+        let first_sketches = parse_compact_sketches(sketch_json.as_bytes(), &config).unwrap();
+        let second_sketches = parse_compact_sketches(sketch_json.as_bytes(), &config).unwrap();
+        let first = sketches_to_translated_schedule(&first_sketches, &config).unwrap();
+        let second = sketches_to_translated_schedule(&second_sketches, &config).unwrap();
+        let first_json =
+            serde_json::to_vec(&to_syccl_resim_input(&first, &config).unwrap()).unwrap();
+        let second_json =
+            serde_json::to_vec(&to_syccl_resim_input(&second, &config).unwrap()).unwrap();
+
+        assert_eq!(first_json, second_json);
+    }
+}
+
+#[test]
+fn allgather_sketch_expansion_matches_fixed_golden_schedule() {
+    let config = parse_config(fixture_config().as_bytes()).unwrap();
+    let sketches = parse_compact_sketches(
+        r#"[
+          [
+            [0, 1, 0, 0, 1],
+            [0, 3, 0, 0, 2],
+            [1, 1, 1, 2, 3]
+          ]
+        ]"#
+        .as_bytes(),
+        &config,
+    )
+    .unwrap();
+    let schedule = sketches_to_translated_schedule(&sketches, &config).unwrap();
+    let actual: Vec<_> = schedule
+        .sends
+        .iter()
+        .map(|send| {
+            (
+                send.src_chunk,
+                send.chunk_index,
+                send.src_gpu,
+                send.dst_gpu,
+                send.epoch,
+                send.layer_used,
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        actual,
+        vec![
+            (0, 0, 0, 1, 0, Some(1)),
+            (0, 0, 0, 2, 0, Some(3)),
+            (0, 0, 2, 3, 1, Some(1)),
+            (1, 0, 1, 0, 0, Some(1)),
+            (1, 0, 1, 3, 0, Some(3)),
+            (1, 0, 3, 2, 1, Some(1)),
+            (2, 0, 2, 3, 0, Some(1)),
+            (2, 0, 2, 0, 0, Some(3)),
+            (2, 0, 0, 1, 1, Some(1)),
+            (3, 0, 3, 2, 0, Some(1)),
+            (3, 0, 3, 1, 0, Some(3)),
+            (3, 0, 1, 0, 1, Some(1)),
+        ]
+    );
+}
+
+#[test]
 fn simulate_sketch_cli_can_dump_translated_schedule_for_syccl_resim() {
     let root = tempdir().unwrap();
     let config_path = root.path().join("config.json");
@@ -699,17 +923,90 @@ fn simulate_sketch_cli_can_dump_translated_schedule_for_syccl_resim() {
     assert_eq!(schedule["init_devs"].as_array().unwrap().len(), 4);
     assert_eq!(
         schedule["init_devs"],
-        serde_json::json!([
-            [[0, 0], [0]],
-            [[1, 0], [1]],
-            [[2, 0], [5]],
-            [[3, 0], [6]]
-        ])
+        serde_json::json!([[[0, 0], [0]], [[1, 0], [1]], [[2, 0], [5]], [[3, 0], [6]]])
     );
     assert_eq!(schedule["Events"].as_array().unwrap().len(), 4);
     assert_eq!(schedule["Events"][0]["src_chunk"], "(0, 0)");
     assert_eq!(schedule["Events"][0]["sends"][0]["copy"], true);
     assert_eq!(schedule["Events"][0]["sends"][0]["reduce"], false);
+}
+
+#[test]
+fn translate_sketch_cli_writes_syccl_schedule_without_running_flow_simulation() {
+    let root = tempdir().unwrap();
+    let config_path = root.path().join("config.json");
+    let sketch_path = root.path().join("sketch.json");
+    let translated_path = root.path().join("candidate-translated.json");
+    fs::write(&config_path, alltoall_round_robin_config()).unwrap();
+    fs::write(&sketch_path, alltoall_round_robin_sketch()).unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_flow-sim-rs"))
+        .arg("translate-sketch")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--sketch")
+        .arg(&sketch_path)
+        .arg("--output")
+        .arg(&translated_path)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let translated: serde_json::Value =
+        serde_json::from_slice(&fs::read(&translated_path).unwrap()).unwrap();
+    assert_eq!(translated["coll_name"], "alltoall");
+    assert_eq!(translated["ngpus"], 6);
+    assert_eq!(
+        translated["algorithms"][0]["final_schedule"]["Schedule"]["Events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        30
+    );
+}
+
+#[test]
+fn streaming_syccl_writer_matches_in_memory_representation() {
+    let config_json = alltoall_round_robin_config();
+    let config = parse_config(config_json.as_bytes()).unwrap();
+    let sketches =
+        parse_compact_sketches(alltoall_round_robin_sketch().as_bytes(), &config).unwrap();
+    let schedule = sketches_to_translated_schedule(&sketches, &config).unwrap();
+    let expected = to_syccl_resim_input(&schedule, &config).unwrap();
+    let mut output = Vec::new();
+
+    write_syccl_resim_input(&schedule, &config, &mut output).unwrap();
+
+    let actual: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn atomic_syccl_writer_preserves_existing_output_when_serialization_fails() {
+    let config = parse_config(fixture_config().as_bytes()).unwrap();
+    let sketches = parse_compact_sketches(
+        r#"[
+          [
+            [0, 1, 0, 0, 1],
+            [0, 3, 0, 0, 2],
+            [1, 1, 1, 2, 3]
+          ]
+        ]"#
+        .as_bytes(),
+        &config,
+    )
+    .unwrap();
+    let mut schedule = sketches_to_translated_schedule(&sketches, &config).unwrap();
+    schedule.ngpus += 1;
+    let root = tempdir().unwrap();
+    let output = root.path().join("candidate-translated.json");
+    fs::write(&output, b"existing-output").unwrap();
+
+    let error = write_syccl_resim_input_atomic(&schedule, &config, &output).unwrap_err();
+
+    assert!(error.to_string().contains("does not match config topology"));
+    assert_eq!(fs::read(&output).unwrap(), b"existing-output");
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
 }
 
 #[test]

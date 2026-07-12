@@ -10,9 +10,10 @@ use flow_sim_rs::batch::{
 };
 use flow_sim_rs::batch_sketch::{build_sketch_manifest, run_sketch_batch, write_sketch_manifest};
 use flow_sim_rs::compare::{compare_manifest, write_compare_report};
-use flow_sim_rs::config::parse_config;
+use flow_sim_rs::config::{parse_config, SimConfig};
 use flow_sim_rs::schedule::{
     parse_all_translated_schedules, parse_translated_schedule, to_syccl_resim_input,
+    write_syccl_resim_input_atomic, TranslatedSchedule,
 };
 use flow_sim_rs::simulator::{simulate_case, SimulationResult};
 use flow_sim_rs::sketch::{parse_compact_sketches, sketches_to_translated_schedule};
@@ -50,6 +51,14 @@ enum Commands {
         output: PathBuf,
         #[arg(long)]
         dump_translated: Option<PathBuf>,
+    },
+    TranslateSketch {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        sketch: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
     Manifest {
         #[arg(long)]
@@ -128,6 +137,11 @@ fn main() -> Result<()> {
             output,
             dump_translated,
         } => simulate_sketch_cmd(&config, &sketch, &output, dump_translated.as_deref()),
+        Commands::TranslateSketch {
+            config,
+            sketch,
+            output,
+        } => translate_sketch_cmd(&config, &sketch, &output),
         Commands::Manifest {
             config,
             input_dir,
@@ -300,13 +314,7 @@ fn simulate_sketch_cmd(
     output: &Path,
     dump_translated: Option<&Path>,
 ) -> Result<()> {
-    let config_file =
-        File::open(config).with_context(|| format!("failed to open {}", config.display()))?;
-    let sketch_file =
-        File::open(sketch).with_context(|| format!("failed to open {}", sketch.display()))?;
-    let config_data = parse_config(config_file)?;
-    let sketches = parse_compact_sketches(sketch_file, &config_data)?;
-    let schedule = sketches_to_translated_schedule(&sketches, &config_data)?;
+    let (config_data, schedule) = load_sketch_schedule(config, sketch)?;
     if let Some(translated_path) = dump_translated {
         if let Some(parent) = translated_path.parent() {
             fs::create_dir_all(parent)?;
@@ -324,6 +332,28 @@ fn simulate_sketch_cmd(
     serde_json::to_writer_pretty(file, &result)?;
     println!("time_us={:.6} output={}", result.time_us, output.display());
     Ok(())
+}
+
+fn translate_sketch_cmd(config: &Path, sketch: &Path, output: &Path) -> Result<()> {
+    let (config_data, schedule) = load_sketch_schedule(config, sketch)?;
+    write_syccl_resim_input_atomic(&schedule, &config_data, output)?;
+    println!(
+        "translated sends={} output={}",
+        schedule.sends.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn load_sketch_schedule(config: &Path, sketch: &Path) -> Result<(SimConfig, TranslatedSchedule)> {
+    let config_file =
+        File::open(config).with_context(|| format!("failed to open {}", config.display()))?;
+    let sketch_file =
+        File::open(sketch).with_context(|| format!("failed to open {}", sketch.display()))?;
+    let config_data = parse_config(config_file)?;
+    let sketches = parse_compact_sketches(sketch_file, &config_data)?;
+    let schedule = sketches_to_translated_schedule(&sketches, &config_data)?;
+    Ok((config_data, schedule))
 }
 
 fn cache_simai_cmd(

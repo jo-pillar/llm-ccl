@@ -100,7 +100,8 @@ pub fn sketches_to_translated_schedule(
         "alltoall" => {
             for src in 0..graph.ngpus {
                 for dst in 0..graph.ngpus {
-                    rotate_path_sends(graph, src, dst, config, &mut sends)?;
+                    let epoch = alltoall_chunk_epoch(src, dst, config);
+                    rotate_path_sends(graph, src, dst, epoch, config, &mut sends)?;
                 }
             }
         }
@@ -454,6 +455,7 @@ fn rotate_path_sends(
     graph: &SketchGraph,
     src_root: usize,
     dst_gpu: usize,
+    epoch: u64,
     config: &SimConfig,
     sends: &mut Vec<SendEvent>,
 ) -> Result<()> {
@@ -499,13 +501,30 @@ fn rotate_path_sends(
             chunk_index: dst_gpu,
             src_gpu: rotate_gpu(parent, src_root, config),
             dst_gpu: rotate_gpu(child, src_root, config),
-            epoch: node.step,
+            epoch,
             layer_used: Some(node.layer),
             order,
             sketch_source: Some(node_source(node)),
         });
     }
     Ok(())
+}
+
+fn alltoall_chunk_epoch(src_root: usize, dst_gpu: usize, config: &SimConfig) -> u64 {
+    let host_count = config.hosts.host_num;
+    let gpus_per_host = config.hosts.gpus_per_host;
+    let src_host = src_root / gpus_per_host;
+    let src_local = src_root % gpus_per_host;
+    let dst_host = dst_gpu / gpus_per_host;
+    let dst_local = dst_gpu % gpus_per_host;
+    let remote_rounds = gpus_per_host * host_count.saturating_sub(1);
+
+    if src_host == dst_host {
+        return (remote_rounds + dst_local) as u64;
+    }
+
+    let host_offset = (dst_host + host_count - src_host) % host_count;
+    (src_local * (host_count - 1) + host_offset - 1) as u64
 }
 
 fn node_source(node: &SketchNode) -> SketchTransmissionSource {
