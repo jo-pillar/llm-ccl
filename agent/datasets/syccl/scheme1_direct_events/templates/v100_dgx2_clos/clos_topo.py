@@ -83,8 +83,8 @@ topology = DGX2ClosTopology(
     65536,
     CollectiveType.ALLGATHER,
     layer1=LayerSpec(1, LinkSpec("125GB/s", "3us"), group_num=4, node_num=16, node_type=NodeType.GPU),
-    layer2=LayerSpec(2, LinkSpec("12.5GB/s", "0us"), group_num=4, node_num=1, node_type=NodeType.NIC),
-    layer3=LayerSpec(3, LinkSpec("12.5GB/s", "25us"), group_num=4, node_num=1, node_type=NodeType.SWITCH),
+    layer2=LayerSpec(2, LinkSpec("400GB/s", "0us"), group_num=4, node_num=1, node_type=NodeType.NIC),
+    layer3=LayerSpec(3, LinkSpec("400GB/s", "25us"), group_num=4, node_num=1, node_type=NodeType.SWITCH),
     layer4=LayerSpec(4, LinkSpec("400GB/s", "25us"), group_num=1, node_num=4, node_type=NodeType.SWITCH),
 )
 ###TopoEND

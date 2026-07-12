@@ -73,6 +73,8 @@ class SycclV100ClosExperimentTest(unittest.TestCase):
         last_gpu = scale.total_gpus - 1
         last_host_first_gpu = scale.total_gpus - scale.gpus_per_host
         self.assertEqual(("125GB/s", "3us"), links[(f"gpu[{last_host_first_gpu}]", f"gpu[{last_gpu}]")])
+        self.assertEqual(("400GB/s", "0us"), links[(f"gpu[{last_host_first_gpu}]", f"nic[{scale.hosts - 1}]")])
+        self.assertEqual(("400GB/s", "25us"), links[(f"nic[{scale.hosts - 1}]", f"leaf[{scale.leaf_switches - 1}]")])
         self.assertEqual(("400GB/s", "25us"), links[(f"leaf[{scale.leaf_switches - 1}]", "spine[0]")])
 
   def test_prepare_experiment_writes_combined_four_and_eight_host_bundle(self):
@@ -123,6 +125,8 @@ class SycclV100ClosExperimentTest(unittest.TestCase):
         self.assertEqual(1, first_config["topo"][-1]["switch_num"])
         self.assertEqual(0.125, first_config["link_spec"]["nvswitch"]["bw_mbpus"])
         self.assertEqual(3, first_config["link_spec"]["nvswitch"]["lat_us"])
+        self.assertEqual(0.4, first_config["link_spec"]["link_nic"]["bw_mbpus"])
+        self.assertEqual(0.4, first_config["link_spec"]["netlink_leaf"]["bw_mbpus"])
         self.assertEqual(0.4, first_config["link_spec"]["netlink_spine"]["bw_mbpus"])
 
         last_config = json.loads(Path(scale_record["cases"][-1]["config_path"]).read_text(encoding="utf-8"))
@@ -132,10 +136,11 @@ class SycclV100ClosExperimentTest(unittest.TestCase):
         self.assertIn(f"    {expected_gpus},", first_topodsl)
         self.assertIn(f"group_num={expected_hosts}, node_num=16", first_topodsl)
         self.assertIn('LinkSpec("125GB/s", "3us")', first_topodsl)
-        self.assertIn('LinkSpec("400GB/s", "25us")', first_topodsl)
+        self.assertEqual(3, first_topodsl.count('LinkSpec("400GB/s"'))
 
         first_instruction = Path(first["instruction_path"]).read_text(encoding="utf-8")
         self.assertIn(f"{expected_gpus} GPU cluster", first_instruction)
+        self.assertIn("Layers 2, 3, and 4 use 400 GB/s network-path links", first_instruction)
         self.assertIn("Layer 4 crosses the Clos spine", first_instruction)
         self.assertIn("Use only layers 1, 3, and 4", first_instruction)
 

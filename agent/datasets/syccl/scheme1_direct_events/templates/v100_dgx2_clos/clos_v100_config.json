@@ -52,11 +52,11 @@
       "lat_us": 3
     },
     "link_nic": {
-      "bw_mbpus": 0.0125,
+      "bw_mbpus": 0.4,
       "lat_us": 0
     },
     "netlink_leaf": {
-      "bw_mbpus": 0.0125,
+      "bw_mbpus": 0.4,
       "lat_us": 25
     },
     "netlink_spine": {
