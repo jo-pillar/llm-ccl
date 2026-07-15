@@ -87,10 +87,14 @@ existing diagnostic material below it as supplementary notes, but mark it as
 not used by the paper figure. Correct blanket `MILP` labels where they refer to
 AlltoAll so the document does not misidentify an LP baseline.
 
-In `cclpaper/hpca/main.tex`, place the figure and sentence in the `Why Exploit
-Symmetry?` subsection after the paragraph that motivates representative
-structures and reuse across roots and source--destination pairs. Use this
-sentence:
+In `cclpaper/hpca/main.tex`, revise the existing closing paragraph of `Why
+Symmetry-Driven Expansion Instead of Symmetry-Assisted MILP?`. Keep its first
+sentence, which identifies schedule quality as the design risk. Replace the
+current second sentence---which both calls every baseline MILP-generated and
+adds an unsupported synthesis-cost clause---with the evidence sentence below;
+do not append a duplicate claim. Place the figure immediately after that
+paragraph so it remains part of the background-and-motivation evidence. Use
+this replacement sentence:
 
 > Across 27 simulated settings on the regular H800-style multirail topology,
 > symmetry-driven deterministic expansion matched or outperformed SyCCL's
@@ -98,6 +102,9 @@ sentence:
 > a geometric-mean speedup of 1.031x.
 
 The LaTeX version must use `\(1.031\times\)` and reference the new figure.
+Remove the replaced sentence's `substantially reducing synthesis cost` clause:
+this result does not measure synthesis cost. Do not alter cost claims elsewhere
+in the paper that rely on separate experiments.
 
 The caption must state that results are simulator-predicted, identify the three
 tested scale/collective groups, define `R`, explain points and diamonds, and
