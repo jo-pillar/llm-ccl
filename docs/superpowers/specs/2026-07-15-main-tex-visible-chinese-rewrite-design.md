@@ -6,7 +6,7 @@ Rewrite every Chinese fragment that is visible in the compiled PDF as fluent aca
 
 ## Scope
 
-The only source file to edit is `cclpaper/hpca/main.tex`. The work covers 51 lines that currently contain PDF-visible Chinese text or Chinese punctuation. Chinese text inside LaTeX comments is explicitly out of scope and must remain byte-for-byte unchanged.
+The only source file to edit is `cclpaper/hpca/main.tex`. The work covers 52 lines that currently contain PDF-visible Chinese text or Chinese punctuation. Chinese text inside LaTeX comments is explicitly out of scope and must remain byte-for-byte unchanged.
 
 External content, including figure source files and `references.bib`, is out of scope. The method section titled `LLM-Friendly Collective Schedule Synthesis` contains no visible Chinese and therefore requires no edits.
 
