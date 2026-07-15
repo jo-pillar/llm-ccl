@@ -3,10 +3,12 @@
 ## Goal
 
 Turn the final results in `cclpaper/eval_result/result5.md` into one compact,
-publication-ready figure and one evidence sentence for the `Why Exploit
-Symmetry?` subsection of `cclpaper/hpca/main.tex`. The evidence must show that,
-in the tested regular multirail configurations, symmetry-driven deterministic
-expansion matches or exceeds the paired solver-generated schedules.
+publication-ready figure and one evidence sentence for the background and
+motivation subsection `Why Symmetry-Driven Expansion Instead of
+Symmetry-Assisted MILP?` in `cclpaper/hpca/main.tex`. The evidence must show
+that, in the tested regular multirail configurations, symmetry-driven
+deterministic expansion matches or exceeds the paired solver-generated
+schedules.
 
 ## Evidence Scope
 
