@@ -82,12 +82,11 @@ The plotting program must be reproducible and export:
 
 ## Document Integration
 
-At the top of `cclpaper/eval_result/result5.md`, add a curated paper-facing
-summary containing the PNG, metric definition, the four-row aggregate table,
-the exact evidence scope, and the simulator/baseline caveats. Preserve the
-existing diagnostic material below it as supplementary notes, but mark it as
-not used by the paper figure. Correct blanket `MILP` labels where they refer to
-AlltoAll so the document does not misidentify an LP baseline.
+Treat `cclpaper/eval_result/result5.md` as a read-only source artifact. Do not
+edit, reformat, rename, or correct it. The plotting program may read the
+archived CSV summaries and may write its generated PNG under
+`cclpaper/eval_result/figures/`, but it must leave `result5.md` byte-for-byte
+unchanged.
 
 In `cclpaper/hpca/main.tex`, revise the existing closing paragraph of `Why
 Symmetry-Driven Expansion Instead of Symmetry-Assisted MILP?`. Keep its first
@@ -135,5 +134,5 @@ reductions; `result5.md` contains schedule-quality evidence only.
   the archived CSVs.
 - The background sentence and caption use scientifically accurate solver and
   simulator terminology.
-- `result5.md` provides a concise, traceable paper-facing summary.
+- `result5.md` remains byte-for-byte unchanged.
 - The HPCA paper compiles successfully with the new figure and reference.
