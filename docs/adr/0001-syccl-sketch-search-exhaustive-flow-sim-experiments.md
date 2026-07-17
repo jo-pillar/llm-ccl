@@ -1,0 +1,3 @@
+# syccl-sketch-search drives exhaustive flow-sim experiments
+
+For DGX-2 V100 Clos experiments, `syccl-sketch-search` owns the sketch-search experiment driver: it reads the prepared experiment bundle as immutable input, exhaustively generates every sketch candidate for each selected SyCCL config, evaluates each sketch with the bundled `flow-sim-rs batch-sketch` path, and writes all search, simulation, and summary artifacts under `syccl-sketch-search`. This keeps the Rust sketch generator and its evaluation results together, preserves resumable intermediate artifacts, and avoids silently turning exhaustive search into top-k or sampled evaluation.
