@@ -55,6 +55,11 @@ cd agent
 uv run pytest tests/test_syccl_topodsl.py tests/test_syccl_simpletes_runner.py
 ```
 
+This selection currently includes four known baseline failures: two stale
+multirail fixture references and two message-size expectation mismatches. See
+`docs/experiments/syccl-retired-flow-cleanup.md` for the exact failures and the
+pre-removal comparison.
+
 The Python SyCCL entry point expects `TOPODSL` in the environment:
 
 ```bash

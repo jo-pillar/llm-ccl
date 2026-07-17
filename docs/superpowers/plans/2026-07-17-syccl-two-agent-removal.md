@@ -62,7 +62,7 @@
 - Modify: `agent/tests/test_syccl_simpletes_runner.py:201-234`
 - Modify: `agent/scripts/run_syccl_simpletes.py:329-357`
 
-- [ ] **Step 1: Strengthen the dry-run test and add a failing non-dry-run test**
+- [x] **Step 1: Strengthen the dry-run test and add a failing non-dry-run test**
 
 Update the existing dry-run test to patch `runner.subprocess.run` and assert it is not called. Add this focused test:
 
@@ -98,7 +98,7 @@ def test_main_non_dry_run_launches_generated_simpletes_command(self):
   )
 ```
 
-- [ ] **Step 2: Run the runner tests and verify the regression is red**
+- [x] **Step 2: Run the runner tests and verify the regression is red**
 
 Run from `agent/`:
 
@@ -111,7 +111,7 @@ uv run --with pytest python -m pytest \
 
 Expected: failure with `SystemExit: 0`; the mocked subprocess is never reached.
 
-- [ ] **Step 3: Apply the minimal runner fix**
+- [x] **Step 3: Apply the minimal runner fix**
 
 Delete only the unconditional exit:
 
@@ -125,7 +125,7 @@ return 0
 
 Do not modify the model flags, `api_key`, logging format, selector, evaluator, or generated command.
 
-- [ ] **Step 4: Run the runner dispatch tests and verify green**
+- [x] **Step 4: Run the runner dispatch tests and verify green**
 
 Run:
 
@@ -139,7 +139,7 @@ uv run --with pytest python -m pytest \
 
 Expected: all three dispatch tests pass. Do not change the separate pre-existing message-size assertions in this test file; they currently expect total collective bytes while the retained renderer emits per-GPU bytes.
 
-- [ ] **Step 5: Commit the runner repair**
+- [x] **Step 5: Commit the runner repair**
 
 ```bash
 git add agent/scripts/run_syccl_simpletes.py agent/tests/test_syccl_simpletes_runner.py
@@ -157,11 +157,11 @@ git commit -m "fix: let SyCCL SimpleTES runner execute searches"
 - Modify: `docs/experiments/h800-llm-ccl-vs-syccl-flow-sim.md:17-22,103-110`
 - Modify: `agent/scripts/prepare_h800_flow_sim_compare.py:1474-1477`
 
-- [ ] **Step 1: Delete the tracked two-agent implementation and artifacts**
+- [x] **Step 1: Delete the tracked two-agent implementation and artifacts**
 
 Use one `apply_patch` deletion patch covering the exact tracked files. Do not remove ignored checkpoint directories, `result/syccl_two_agent_10r/`, or any unrelated untracked path.
 
-- [ ] **Step 2: Update the root engineering guide**
+- [x] **Step 2: Update the root engineering guide**
 
 Apply these content changes to `AGENT.md`:
 
@@ -181,7 +181,7 @@ uv run python scripts/run_syccl_simpletes.py \
 
 - Retain notes for `topodsl.py`, `config_render.py`, and config templates; replace deleted-module notes with a statement that `run_syccl_simpletes.py` is the SyCCL Python entry point.
 
-- [ ] **Step 3: Remove stale experiment references**
+- [x] **Step 3: Remove stale experiment references**
 
 In `docs/experiments/h800-llm-ccl-vs-syccl-flow-sim.md`:
 
@@ -198,7 +198,7 @@ In `agent/scripts/prepare_h800_flow_sim_compare.py`, replace the stale note with
 "llm-ccl run scripts use the SimpleTES llm_elite path.",
 ```
 
-- [ ] **Step 4: Verify reference and import cleanup**
+- [x] **Step 4: Verify reference and import cleanup**
 
 Run from the repository root against Git-tracked files, including tracked hidden files, experiment files, and tracked test fixtures:
 
@@ -208,10 +208,11 @@ git grep -n -I -i -E \
   -- . \
   ':(exclude)cclpaper/**' \
   ':(exclude)docs/superpowers/specs/2026-07-17-syccl-two-agent-removal-design.md' \
-  ':(exclude)docs/superpowers/plans/2026-07-17-syccl-two-agent-removal.md'
+  ':(exclude)docs/superpowers/plans/2026-07-17-syccl-two-agent-removal.md' \
+  ':(exclude)docs/experiments/syccl-retired-flow-cleanup.md'
 ```
 
-Expected: no matches and exit code 1 from `git grep`. The exclusions are limited to paper sources and the current removal documents; ignored historical results are absent automatically because `git grep` searches tracked files.
+Expected: no matches and exit code 1 from `git grep`. The exclusions are limited to paper sources, the current removal documents, and the cleanup report; ignored historical results are absent automatically because `git grep` searches tracked files.
 
 Run:
 
@@ -222,7 +223,7 @@ rg -n 'syccl_agents\.(flow_sim|llm|prompts|record_agent|records|runner|sketch_ds
 
 Expected: no matches.
 
-- [ ] **Step 5: Inspect the deletion boundary**
+- [x] **Step 5: Inspect the deletion boundary**
 
 Run:
 
@@ -234,7 +235,7 @@ git diff --name-status
 
 Expected: only the planned tracked deletions and three live reference edits, plus the runner/test changes already committed. Existing unrelated untracked files remain unmodified.
 
-- [ ] **Step 6: Commit the workflow removal**
+- [x] **Step 6: Commit the workflow removal**
 
 Stage only the planned tracked paths, then commit:
 
@@ -250,7 +251,7 @@ git commit -m "refactor: remove retired SyCCL two-agent flow"
 
 - Test only; no expected source changes.
 
-- [ ] **Step 1: Run the SyCCL regression suite**
+- [x] **Step 1: Run the SyCCL regression suite**
 
 Run from `agent/`:
 
@@ -264,7 +265,7 @@ uv run --with pytest python -m pytest \
 
 Expected: no new failures relative to the recorded clean-worktree baseline. The baseline already contains stale fixture/layer failures in `test_syccl_topodsl.py` and `test_topology_examples.py`, plus message-size expectation failures in `test_syccl_simpletes_runner.py`; record these with exact test names rather than expanding scope. Tests requiring unavailable optional external infrastructure may skip explicitly. Any additional failure must be investigated rather than ignored.
 
-- [ ] **Step 2: Compile retained entry points and shared modules**
+- [x] **Step 2: Compile retained entry points and shared modules**
 
 Run from the repository root:
 
@@ -279,7 +280,7 @@ python -m py_compile \
 
 Expected: exit code 0 and no output.
 
-- [ ] **Step 3: Run repository hygiene checks**
+- [x] **Step 3: Run repository hygiene checks**
 
 Run:
 
@@ -298,7 +299,7 @@ Expected: no whitespace errors; unrelated untracked files remain unchanged.
 
 - Runtime output only under `/tmp/syccl-dataset-e2e`; no repository files should change.
 
-- [ ] **Step 1: Check E2E prerequisites without printing credentials**
+- [x] **Step 1: Check E2E prerequisites without printing credentials**
 
 Run from `agent/`:
 
@@ -342,7 +343,7 @@ import json
 import math
 from pathlib import Path
 
-roots = list(Path("/tmp/syccl-dataset-e2e").glob("*/clos/allgather/64k/FULL"))
+roots = list(Path("/tmp/syccl-dataset-e2e").glob("*/clos/allgather/1k/FULL"))
 assert len(roots) == 1, roots
 case = roots[0]
 
