@@ -125,15 +125,19 @@ return 0
 
 Do not modify the model flags, `api_key`, logging format, selector, evaluator, or generated command.
 
-- [ ] **Step 4: Run the runner tests and verify green**
+- [ ] **Step 4: Run the runner dispatch tests and verify green**
 
 Run:
 
 ```bash
-uv run --with pytest python -m pytest tests/test_syccl_simpletes_runner.py -q
+uv run --with pytest python -m pytest \
+  tests/test_syccl_simpletes_runner.py::SycclSimpletesRunnerTest::test_main_dry_run_uses_topodsl_env_and_new_cli_inputs \
+  tests/test_syccl_simpletes_runner.py::SycclSimpletesRunnerTest::test_main_non_dry_run_launches_generated_simpletes_command \
+  tests/test_syccl_simpletes_runner.py::SycclSimpletesRunnerTest::test_script_can_run_directly_from_scripts_path \
+  -q
 ```
 
-Expected: all tests pass.
+Expected: all three dispatch tests pass. Do not change the separate pre-existing message-size assertions in this test file; they currently expect total collective bytes while the retained renderer emits per-GPU bytes.
 
 - [ ] **Step 5: Commit the runner repair**
 
@@ -258,7 +262,7 @@ uv run --with pytest python -m pytest \
   -q
 ```
 
-Expected: all collected retained SyCCL tests pass. Tests requiring unavailable optional external infrastructure may skip explicitly; failures must be investigated rather than ignored.
+Expected: no new failures relative to the recorded clean-worktree baseline. The baseline already contains stale fixture/layer failures in `test_syccl_topodsl.py` and `test_topology_examples.py`, plus message-size expectation failures in `test_syccl_simpletes_runner.py`; record these with exact test names rather than expanding scope. Tests requiring unavailable optional external infrastructure may skip explicitly. Any additional failure must be investigated rather than ignored.
 
 - [ ] **Step 2: Compile retained entry points and shared modules**
 
