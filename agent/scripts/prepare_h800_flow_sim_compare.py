@@ -1473,7 +1473,7 @@ def write_launch_manifest(
       },
       "notes": [
           "Preparation only. Do not start long solve/search runs until this bundle is inspected.",
-          "llm-ccl run scripts use SimpleTES llm_elite and do not use the SyCCL two-agent path.",
+          "llm-ccl run scripts use the SimpleTES llm_elite path.",
       ],
   }
   write_json(bundle / "manifest.json", manifest)

@@ -1,1 +1,0 @@
-SyCCL two-agent search is driven by SycclTwoAgentRuntime; this file keeps SimpleTES task metadata valid.

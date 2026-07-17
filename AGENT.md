@@ -15,7 +15,7 @@ Treat this as a multi-project repo. Do not assume a command from one subtree app
 Before editing, read the local guide for the subtree you are touching:
 
 - Root coordination: this file.
-- Python agent work: `agent/README.md`, then `agent/syccl_agents/README.md` for SyCCL two-agent work.
+- Python agent work: `agent/README.md`.
 - C++ SyCCL work: `syccl/AGENTS.md` and `syccl/README.md`.
 - Rust sketch search: `syccl-sketch-search/README.md`.
 - Paper work: `cclpaper/AGENTS.md`, `cclpaper/writingrules.md`, and the active CoPaper state if needed.
@@ -52,28 +52,17 @@ Targeted SyCCL tests:
 
 ```bash
 cd agent
-uv run pytest tests/test_syccl_topodsl.py tests/test_syccl_two_agent.py
+uv run pytest tests/test_syccl_topodsl.py tests/test_syccl_simpletes_runner.py
 ```
 
-SyCCL two-agent example which you SHOULD NOT start unlese you are asked to do a two agent search:
+The Python SyCCL entry point expects `TOPODSL` in the environment:
 
 ```bash
 cd agent
-uv run python scripts/run_syccl_two_agent.py \
-  --topo examples/topologies/clos_topo.py \
-  --output-dir test_result/syccl_two_agent_demo \
-  --rounds 1 \
-  --flow-sim-bin ../Flow-Simulator/flow-sim-rs/target/debug/flow-sim-rs \
-  --save-llm-io
-```
-
-The legacy SimpleTES SyCCL wrapper expects `TOPODSL` in the environment:
-
-```bash
-cd agent
-TOPODSL=examples/topologies/clos_topo.py uv run python scripts/run_syccl_simpletes.py \
-  --init-program datasets/syccl/scheme1_direct_events/init_program.py \
-  --instruction datasets/syccl/scheme1_direct_events/prompt_templete.txt \
+TOPODSL=datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/clos_topo.py \
+uv run python scripts/run_syccl_simpletes.py \
+  --init-program datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/clos_program.py \
+  --instruction datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/prompt_template.txt \
   --dry-run
 ```
 
@@ -113,11 +102,7 @@ prefer uv for python environment management
 
 - `agent/syccl_agents/topodsl.py` normalizes TopoDSL into `TopologyParams`.
 - `agent/syccl_agents/config_render.py` renders JSON configs from `TopologyParams`.
-- `agent/syccl_agents/sketch_dsl.py` validates compact sketch transmissions.
-- `agent/syccl_agents/flow_sim.py` wraps `flow-sim-rs`.
-- `agent/simpletes/engine/syccl_two_agent.py` hosts the current two-agent runtime.
-- Prompt templates live under `agent/prompt/syccl_two_agent/`.
 - Config templates live under `agent/syccl_agents/config_templates/`.
+- `agent/scripts/run_syccl_simpletes.py` is the Python SyCCL entry point.
 
 The legacy environment variables named `SYCCL_TASK_*` are intentionally removed by `run_syccl_simpletes.py`. New topology-dependent behavior should flow through TopoDSL-derived config and explicit generated files instead.
-
