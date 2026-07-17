@@ -341,7 +341,6 @@ def main(argv: list[str] | None = None) -> int:
   )
   
   LOGGER.info("SimpleTES command: %s", " ".join(spec.command))
-  exit(0)
   if args.dry_run:
     print("Command:")
     print(" ".join(spec.command))

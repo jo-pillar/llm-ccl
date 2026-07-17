@@ -210,28 +210,60 @@ def construct_sketches(GPU_NUM):
       template_path.write_text("GPU=${GPU_NUM}", encoding="utf-8")
       runner = load_runner()
 
-      with patch.dict("os.environ", {"TOPODSL": str(topo_path)}, clear=False):
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout):
-          result = runner.main([
-              "--init-program",
-              str(init_path),
-              "--instruction",
-              str(template_path),
-              "--max-generations",
-              "1",
-              "--output-root",
-              str(output_root),
-              "--env-toml",
-              str(tmp_path / "missing-env.toml"),
-              "--dry-run",
-          ])
+      with patch.object(runner.subprocess, "run") as subprocess_run:
+        with patch.dict("os.environ", {"TOPODSL": str(topo_path)}, clear=False):
+          stdout = io.StringIO()
+          with contextlib.redirect_stdout(stdout):
+            result = runner.main([
+                "--init-program",
+                str(init_path),
+                "--instruction",
+                str(template_path),
+                "--max-generations",
+                "1",
+                "--output-root",
+                str(output_root),
+                "--env-toml",
+                str(tmp_path / "missing-env.toml"),
+                "--dry-run",
+            ])
 
       self.assertEqual(0, result)
-      self.assertIn("SimpleTES command:", stdout.getvalue())
+      subprocess_run.assert_not_called()
+      self.assertIn("Command:", stdout.getvalue())
       self.assertIn("uv run python main.py", stdout.getvalue())
-      generated = list(output_root.glob("*/clos/allgather/4k/FULL/generated/flow-sim-config.json"))
-      self.assertEqual(1, len(generated))
+      self.assertIn("Environment:", stdout.getvalue())
+
+  def test_main_non_dry_run_launches_generated_simpletes_command(self):
+    runner = load_runner()
+    fake_topo = object()
+    fake_spec = runner.RunSpec(
+        command=["fake-simpletes", "--search"],
+        env={"FAKE_ENV": "1"},
+        cwd=Path("/tmp/fake-simpletes"),
+        instruction_path=Path("/tmp/instruction.txt"),
+        output_path=Path("/tmp/output"),
+        config_path=Path("/tmp/config.json"),
+        init_program_path=Path("/tmp/init_program.py"),
+    )
+
+    with patch.object(runner, "load_required_topodsl_from_env", return_value=fake_topo):
+      with patch.object(runner, "build_command", return_value=fake_spec):
+        with patch.object(runner.subprocess, "run") as subprocess_run:
+          result = runner.main([
+              "--init-program",
+              "init.py",
+              "--instruction",
+              "instruction.txt",
+          ])
+
+    self.assertEqual(0, result)
+    subprocess_run.assert_called_once_with(
+        fake_spec.command,
+        cwd=fake_spec.cwd,
+        env=fake_spec.env,
+        check=True,
+    )
 
   def test_old_manifest_cli_is_rejected(self):
     runner = load_runner()
