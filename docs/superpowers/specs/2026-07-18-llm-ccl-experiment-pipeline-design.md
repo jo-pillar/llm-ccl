@@ -289,6 +289,10 @@ manifest and rejects a mismatched mirror. Once frozen, search and selection
 commands are rejected for that bundle; a different search result requires a
 new bundle launch.
 
+If every case ended in search failure, the frozen plan is empty. Resim then
+finishes without launching FlowSim or SyCCL; reporting still includes all failed
+cases and the overall workflow returns non-zero.
+
 Resim then uses the validated repository conversion path for each entry in the
 frozen plan without invoking SyCCL solving:
 
@@ -305,11 +309,32 @@ synthesize -f candidate-config.json
   -o resim.json
 ```
 
+Immediately before every first execution or retry, resim recomputes the selected
+config and sketch SHA256 values and compares them with the frozen plan. A
+mismatch fails that entry with `artifact_hash_mismatch` before FlowSim or SyCCL
+is launched. Recovery may recreate a missing `resim-plan.json` mirror from the
+manifest, but it never updates planned hashes from mutable files.
+
 The stage records command lines, binary paths, binary hashes when available,
 wall time, exit status, FlowSim time, and SyCCL `Time`. Entries run only from
 the frozen plan. A successful entry is skipped during resume; an interrupted or
 failed entry can be retried without rerunning search or selection. `--force`
 reruns every planned entry but does not change the frozen candidate set.
+
+Bundle phases transition as follows:
+
+```text
+open -> resim_frozen -> resimulating -> finished
+```
+
+`resimulating` means at least one planned entry has an active lease. When no
+lease remains and every planned entry is succeeded, failed, or interrupted, the
+bundle becomes `finished`; per-entry status distinguishes complete success from
+partial failure. Calling `resim` on a finished bundle retries only failed or
+interrupted entries and returns to `resimulating`. If every entry already
+succeeded, it is a no-op unless `--force` is supplied. `--force` reopens the
+same frozen plan and reruns every entry; it never returns the bundle to `open`
+and never permits search or selection changes.
 
 ### Report
 
@@ -436,6 +461,7 @@ manifest lock used to verify that no search or selection lease is live.
 - `--force` is required to rerun a successful stage. Search force-runs create a
   new attempt instead of overwriting artifacts.
 - Missing or corrupt selected artifacts invalidate selection and prevent resim for that case.
+- A selected config/sketch hash mismatch after freezing fails that planned entry before any simulator process starts.
 - Resim refuses to freeze while any bundle case is pending/running search, while
   a successful search lacks a selection, or while a search/selection lease is live.
 - Search and selection are rejected after `resim-plan.json` is frozen.
