@@ -325,6 +325,8 @@ Bundle phases transition as follows:
 
 ```text
 open -> resim_frozen -> resimulating -> finished
+                    \-----------------> finished  (empty plan)
+finished -> resimulating -> finished              (retry/force, non-empty plan)
 ```
 
 `resimulating` means at least one planned entry has an active lease. When no
@@ -334,7 +336,8 @@ partial failure. Calling `resim` on a finished bundle retries only failed or
 interrupted entries and returns to `resimulating`. If every entry already
 succeeded, it is a no-op unless `--force` is supplied. `--force` reopens the
 same frozen plan and reruns every entry; it never returns the bundle to `open`
-and never permits search or selection changes.
+and never permits search or selection changes. For an empty finished plan,
+`--force` is also a no-op and the phase remains `finished`.
 
 ### Report
 
