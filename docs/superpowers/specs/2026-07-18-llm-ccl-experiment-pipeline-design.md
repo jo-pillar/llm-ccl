@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-18
 
-**Status:** Approved in conversation; ready for implementation planning after document review.
+**Status:** Revised and approved in conversation; awaiting document review.
 
 ## Context
 
@@ -13,10 +13,10 @@ The desired workflow is:
 1. Instantiate a topology template at one or more cluster scales.
 2. Generate LLM-CCL search cases for the requested collective and total message sizes.
 3. Run LLM-CCL with FlowSim as the search evaluator, using only the `all` elite-selection strategy.
-4. Select the fastest valid candidate within that single search run.
-5. Export the selected candidate as a translated schedule with `flow-sim-rs simulate-sketch --dump-translated`.
-6. Run SyCCL `resim` on the translated schedule.
-7. Produce resumable manifests and machine-readable reports.
+4. After all requested searches reach a terminal state, select one fastest valid candidate for each successful case.
+5. Freeze those per-case selections into one immutable bundle-wide resim plan.
+6. Only after that barrier, export each planned candidate with `flow-sim-rs simulate-sketch --dump-translated` and run SyCCL `resim`.
+7. Produce resumable manifests and machine-readable reports, including cases whose search failed and therefore were not resimulated.
 
 The existing experiment scripts and historical experiment outputs must remain intact. The new implementation will live under `agent/scripts/llm-ccl/`.
 
@@ -28,6 +28,7 @@ The existing experiment scripts and historical experiment outputs must remain in
 - Keep each pipeline stage separately runnable and resumable.
 - Make adding a new experiment project require only templates and a small declarative project module.
 - Give every case deterministic artifact paths and explicit stage status.
+- Run resim only as a final bundle-wide phase over the one selected best candidate for each successful case.
 - Use SyCCL `resim`; do not invoke SyCCL `solve`.
 
 ## Non-goals
@@ -47,6 +48,7 @@ The existing experiment scripts and historical experiment outputs must remain in
 - **Case:** One scale, collective, and total-message-size combination.
 - **Search artifact:** A valid LLM-CCL candidate configuration, sketch, and FlowSim result.
 - **Selected artifact:** The fastest valid search artifact in the single `all`-strategy run for one case.
+- **Resim plan:** An immutable bundle-wide snapshot containing exactly one selected artifact for each successful case that will be resimulated.
 - **Bundle:** The immutable prepared inputs plus mutable stage outputs for one project launch.
 
 ## Directory Structure
@@ -236,6 +238,13 @@ attempts. A successful prior search is skipped unless `--force` is supplied.
 Rerunning a failed search or forcing a successful search creates the next
 attempt directory; it never writes new artifacts into an older attempt.
 
+Every running attempt owns a lease containing a run ID, host, process ID, and
+heartbeat timestamp. The runner refreshes the heartbeat while the external
+search command is active. Before search, selection, or resim barrier checks,
+the pipeline reconciles expired leases as `interrupted`. A live lease blocks a
+conflicting operation for the same case; an interrupted attempt remains in the
+append-only history and a retry receives a new attempt directory.
+
 ### Select
 
 Selection scans only one search attempt: by default the latest successful
@@ -254,9 +263,34 @@ with `selection.json` recording the source search attempt, source artifact, and
 score. A new successful search attempt invalidates the previous selection and
 resim state until selection is run again.
 
+Selection is allowed only when that case has no live search attempt. Starting a
+new search for a selected case is allowed only before the resim plan is frozen;
+it invalidates that case's selection. Selection itself uses a short operation
+lease so a conflicting search cannot start while selected files are being
+materialized.
+
 ### Resim
 
-Resim uses the validated repository conversion path without invoking SyCCL solving:
+Resim is a final bundle-wide phase, not a per-case operation interleaved with
+search. It may begin only when:
+
+- every bundle case has terminal search state (`succeeded` or `failed`);
+- every successfully searched case has exactly one succeeded selection;
+- there are no live search or selection leases;
+- the bundle has not already been frozen with a different selection set.
+
+Failed-search cases are recorded as excluded. For every successful case, the
+pipeline builds a plan containing the case ID, selected attempt, selected
+FlowSim score, config/sketch paths, and SHA256 hashes. The atomic manifest
+update is the freeze commit point: it stores the complete plan payload, its
+hash, and phase `resim_frozen`. `resim-plan.json` is then written as an immutable
+mirror of that committed payload. Recovery recreates a missing mirror from the
+manifest and rejects a mismatched mirror. Once frozen, search and selection
+commands are rejected for that bundle; a different search result requires a
+new bundle launch.
+
+Resim then uses the validated repository conversion path for each entry in the
+frozen plan without invoking SyCCL solving:
 
 ```text
 flow-sim-rs simulate-sketch
@@ -271,7 +305,11 @@ synthesize -f candidate-config.json
   -o resim.json
 ```
 
-The stage records command lines, binary paths, binary hashes when available, wall time, exit status, FlowSim time, and SyCCL `Time`. A successful prior resim is skipped unless `--force` is supplied.
+The stage records command lines, binary paths, binary hashes when available,
+wall time, exit status, FlowSim time, and SyCCL `Time`. Entries run only from
+the frozen plan. A successful entry is skipped during resume; an interrupted or
+failed entry can be retried without rerunning search or selection. `--force`
+reruns every planned entry but does not change the frozen candidate set.
 
 ### Report
 
@@ -296,7 +334,11 @@ python agent/scripts/llm-ccl/run.py status --bundle BUNDLE
 python agent/scripts/llm-ccl/run.py run --project PROJECT [options]
 ```
 
-`run` executes `prepare`, `search`, `select`, `resim`, and `report` in order. The separate commands are the primary recovery and cluster-operation interface.
+`run` executes `prepare`, waits for all searches, selects one best candidate per
+successful case, freezes the complete resim plan, runs the planned resims, and
+writes the report. It never starts resim while any search or selection remains
+active. The separate commands are the primary recovery and cluster-operation
+interface.
 
 The default bundle destination is
 `experiments/llm-ccl/PROJECT/YYYYMMDD-HHMMSS/`. `prepare` and `run` accept
@@ -305,12 +347,12 @@ existing destination rather than merging with or overwriting it; resuming an
 existing launch always uses a stage command with `--bundle`.
 
 `prepare` and `run` accept a repeatable `--case CASE_ID` to create and run a
-project subset. `search`, `select`, and `resim` accept the same filter for an
-existing bundle; with no filter they operate on every case. `status` may filter
-displayed cases. `report` always reports the full bundle and does not accept a
-case filter, so a partial report cannot silently overwrite the bundle-wide
-summary with a subset. `select` additionally accepts `--attempt N` when a
-specific successful search attempt must be selected.
+project subset. `search` and `select` accept the same filter for recovery on an
+open bundle; with no filter they operate on every case. `resim` and `report`
+always operate on the full bundle and do not accept a case filter. This ensures
+the frozen resim plan and persisted report cannot silently represent only a
+subset. `status` may filter displayed cases. `select` additionally accepts
+`--attempt N` when a specific successful search attempt must be selected.
 
 Binary and model configuration is supplied through explicit flags or environment/config files. New code must not probe inaccessible hard-coded `/root/...` paths at import time.
 
@@ -319,6 +361,7 @@ Binary and model configuration is supplied through explicit flags or environment
 ```text
 bundle/
 ├── manifest.json
+├── resim-plan.json
 ├── cases/
 │   └── CASE_ID/
 │       ├── topodsl.py
@@ -348,6 +391,8 @@ bundle/
 ```
 
 Case IDs are validated path-safe slugs and must be unique within a project.
+`resim-plan.json` does not exist while the bundle is open. After it is written,
+its selected paths and hashes are immutable.
 
 ## Manifest and State
 
@@ -360,13 +405,16 @@ The bundle manifest contains:
 - case metadata;
 - resolved command configuration without secrets;
 - per-case stage records;
-- binary provenance gathered when a stage runs.
+- binary provenance gathered when a stage runs;
+- bundle phase (`open`, `resim_frozen`, `resimulating`, or `finished`);
+- operation leases and the frozen resim-plan hash.
 
 Stage states are:
 
 ```text
 pending -> running -> succeeded
                    -> failed
+                   -> interrupted
 ```
 
 Each stage also records attempt count, timestamps, error category, and a short
@@ -374,16 +422,25 @@ error message. Search keeps an append-only list of attempt records and a
 `latest_successful_attempt` pointer. Selection records the exact attempt it
 consumed. Manifest writes use a temporary file followed by atomic replacement.
 Secrets are never written to the manifest or logs by the orchestration layer.
+Running search, selection, and resim operations record a run ID, owner, and
+heartbeat. Recovery reconciles expired leases before deciding whether a stage
+is still active. Freezing the resim plan changes the bundle phase under the same
+manifest lock used to verify that no search or selection lease is live.
 
 ## Error Handling
 
 - Template and project errors fail the entire `prepare` command before search begins.
-- Search, selection, and resim failures are isolated per case.
+- Search, selection, and planned resim failures are isolated per case.
 - Commands return non-zero when any requested case fails.
 - Existing successful stages are skipped by default.
 - `--force` is required to rerun a successful stage. Search force-runs create a
   new attempt instead of overwriting artifacts.
 - Missing or corrupt selected artifacts invalidate selection and prevent resim for that case.
+- Resim refuses to freeze while any bundle case is pending/running search, while
+  a successful search lacks a selection, or while a search/selection lease is live.
+- Search and selection are rejected after `resim-plan.json` is frozen.
+- Expired operation leases are marked `interrupted` and may be retried; live
+  leases are never overwritten by a recovery command.
 - Search preflight checks model configuration, evaluator path, topology inputs, and FlowSim availability.
 - Resim preflight checks `flow-sim-rs simulate-sketch --help` for `--dump-translated` support and verifies the SyCCL `synthesize` binary.
 - Large SyCCL output files are scanned incrementally for the top-level `Time` field instead of loaded fully into memory.
@@ -403,6 +460,8 @@ Tests use `unittest` so they run in the existing agent virtual environment witho
 - Candidate selection ignores invalid results and deterministically chooses the lowest positive FlowSim time.
 - Manifest transitions, atomic writes, resume behavior, and `--force` behavior.
 - Search-attempt isolation and selection from exactly one attempt.
+- Lease heartbeat, interrupted-attempt reconciliation, and conflicting-operation rejection.
+- Resim barrier validation and immutable resim-plan hashing.
 - Incremental SyCCL `Time` extraction.
 
 ### Topology regression tests
@@ -417,10 +476,14 @@ Tests use `unittest` so they run in the existing agent virtual environment witho
 Fake executable adapters stand in for LLM-CCL, FlowSim, and SyCCL. A full test runs:
 
 ```text
-prepare -> search -> select -> resim -> report
+prepare -> all searches terminal -> per-case selection -> freeze resim plan -> batch resim -> report
 ```
 
-The integration tests cover success, a failed case among successful cases, resume, forced rerun, missing artifacts, and unsupported `--dump-translated` preflight.
+The integration tests cover success, a failed search case excluded from resim,
+barrier rejection while a search is live, immutable plan freezing, interrupted
+resim resume, forced batch rerun, missing artifacts, and unsupported
+`--dump-translated` preflight. They assert SyCCL is never started before all
+search and selection work reaches the barrier.
 
 ## Adding a New Experiment Project
 
@@ -455,8 +518,10 @@ The README includes one minimal example project and a checklist for topology, co
 - No new workflow command invokes SyCCL `solve`.
 - Each case launches exactly one `all`-strategy search.
 - The fastest valid candidate within that run is selected deterministically.
-- FlowSim exports a translated schedule for the selected candidate.
-- SyCCL `resim` completes from that translated schedule and its `Time` is reported.
+- Each successful case contributes exactly one selected candidate to an immutable resim plan.
+- No FlowSim export or SyCCL resim begins before every bundle search is terminal and every successful search is selected.
+- FlowSim exports a translated schedule for each planned candidate.
+- SyCCL `resim` completes from each translated schedule and its `Time` is reported.
 - Interrupted runs resume without repeating successful work.
 - A new example project can be added without modifying the orchestration implementation or a central registry.
 - Existing preparation scripts and historical outputs remain untouched.
