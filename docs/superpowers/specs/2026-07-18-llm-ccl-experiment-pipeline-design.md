@@ -149,6 +149,11 @@ The new implementation starts with two projects while leaving their old scripts 
 - Collective: AllGather.
 - Total message sizes: `65536`, `262144`, `1048576`, `4194304`, `16777216`, `67108864`, `268435456`, `1073741824`, `4294967296`, `17179869184`, `68719476736`, and `274877906944` bytes.
 - The V100 template uses flat global GPU node identifiers consistently across the NVSwitch and NIC layers.
+- The implementation is explicitly authorized to update
+  `agent/datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/clos_topo.py`
+  so its host-local NVSwitch edges use the same flat global GPU identifiers as
+  its GPU-to-NIC edges. This is the only existing topology-template source edit
+  required by the new pipeline.
 - The V100 template values are authoritative:
   - Layer 1: `150GB/s`, `3us`.
   - Layer 3: `12.5GB/s`, `3us`.
@@ -175,7 +180,21 @@ The new implementation starts with two projects while leaving their old scripts 
 
 The topology template is therefore the single source for physical structure and link values. The project supplies only scale dimensions and workload parameters.
 
-For every case, `total_message_size` must be positive and divisible by `gpu_count`. The generated configuration's `coll.byte` is the per-rank value `total_message_size // gpu_count`.
+Message-size semantics have exactly one conversion:
+
+- `CaseSpec.total_message_size`, the rendered topology constructor's
+  `coll_bytes`, and the manifest's `total_message_size` are total bytes across
+  the collective.
+- `total_message_size` must be positive and divisible by `gpu_count`.
+- `syccl_agents.topodsl.load_topodsl` normalizes the rendered topology object to
+  `TopologyParams.message_size = total_message_size // gpu_count`.
+- `syccl_agents.config_render` copies that normalized value into
+  `config["coll"]["byte"]`; the pipeline must not divide it a second time.
+- Instruction rendering exposes `MESSAGE_SIZE` as the per-rank `coll.byte` and
+  additionally exposes `TOTAL_MESSAGE_SIZE` for future templates. Existing
+  templates continue to work without using the new placeholder.
+- The manifest records both `total_message_size` and `coll_byte` and validates
+  `coll_byte * gpu_count == total_message_size`.
 
 ## Pipeline Stages
 
@@ -202,18 +221,36 @@ Each case has one LLM-CCL search task. The command uses the existing SimpleTES e
 
 The new pipeline does not create `linear_rank` or `balance` tasks. Search concurrency is controlled by `--jobs`; tool-specific evaluator and generation concurrency remain explicit CLI options or project-independent defaults.
 
-Search writes checkpoints, evaluator artifacts, and a case log. A successful prior search is skipped unless `--force` is supplied.
+Every search invocation writes to a new immutable attempt directory:
+
+```text
+search/attempt-0001/
+search/attempt-0002/
+```
+
+Each attempt contains its own checkpoints, evaluator artifacts, log, command,
+and result metadata. The manifest records the current attempt and all prior
+attempts. A successful prior search is skipped unless `--force` is supplied.
+Rerunning a failed search or forcing a successful search creates the next
+attempt directory; it never writes new artifacts into an older attempt.
 
 ### Select
 
-Selection scans only the current case's `all`-strategy evaluator artifacts. A candidate is eligible when:
+Selection scans only one search attempt: by default the latest successful
+attempt recorded in the manifest, or an explicit `--attempt` when provided.
+It never merges candidates across attempts. A candidate is eligible when:
 
 - its candidate configuration exists and parses;
 - its candidate sketch exists and parses;
 - its FlowSim output exists;
 - the FlowSim time is finite and positive.
 
-The candidate with the lowest FlowSim time is selected. Ties are broken by a stable lexical artifact path so reruns are deterministic. The selected configuration and sketch are copied into the case's `best/` directory together with `selection.json` recording the source artifact and score.
+The candidate with the lowest FlowSim time is selected. Ties are broken by a
+stable lexical artifact path so reruns are deterministic. The selected
+configuration and sketch are copied into the case's `best/` directory together
+with `selection.json` recording the source search attempt, source artifact, and
+score. A new successful search attempt invalidates the previous selection and
+resim state until selection is run again.
 
 ### Resim
 
@@ -259,6 +296,13 @@ python agent/scripts/llm-ccl/run.py run --project PROJECT [options]
 
 `run` executes `prepare`, `search`, `select`, `resim`, and `report` in order. The separate commands are the primary recovery and cluster-operation interface.
 
+The default bundle destination is
+`experiments/llm-ccl/PROJECT/YYYYMMDD-HHMMSS/`. `prepare` and `run` accept
+`--bundle-root` and `--launch-id` to override it. Stage commands accept a
+repeatable `--case CASE_ID` filter; with no filter, they operate on every case
+in the bundle. `select` additionally accepts `--attempt N` when a specific
+successful search attempt must be selected.
+
 Binary and model configuration is supplied through explicit flags or environment/config files. New code must not probe inaccessible hard-coded `/root/...` paths at import time.
 
 ## Bundle Layout
@@ -273,9 +317,13 @@ bundle/
 │       ├── instruction.txt
 │       ├── init_program.py
 │       ├── search/
-│       │   ├── checkpoints/
-│       │   ├── eval_artifacts/
-│       │   └── run.log
+│       │   ├── attempt-0001/
+│       │   │   ├── checkpoints/
+│       │   │   ├── eval_artifacts/
+│       │   │   ├── command.json
+│       │   │   └── run.log
+│       │   └── attempt-0002/
+│       │       └── ...
 │       ├── best/
 │       │   ├── candidate-config.json
 │       │   ├── candidate-sketch.json
@@ -312,7 +360,11 @@ pending -> running -> succeeded
                    -> failed
 ```
 
-Each stage also records attempt count, timestamps, error category, and a short error message. Manifest writes use a temporary file followed by atomic replacement. Secrets are never written to the manifest or logs by the orchestration layer.
+Each stage also records attempt count, timestamps, error category, and a short
+error message. Search keeps an append-only list of attempt records and a
+`latest_successful_attempt` pointer. Selection records the exact attempt it
+consumed. Manifest writes use a temporary file followed by atomic replacement.
+Secrets are never written to the manifest or logs by the orchestration layer.
 
 ## Error Handling
 
@@ -320,7 +372,8 @@ Each stage also records attempt count, timestamps, error category, and a short e
 - Search, selection, and resim failures are isolated per case.
 - Commands return non-zero when any requested case fails.
 - Existing successful stages are skipped by default.
-- `--force` is required to rerun or overwrite a successful stage.
+- `--force` is required to rerun a successful stage. Search force-runs create a
+  new attempt instead of overwriting artifacts.
 - Missing or corrupt selected artifacts invalidate selection and prevent resim for that case.
 - Search preflight checks model configuration, evaluator path, topology inputs, and FlowSim availability.
 - Resim preflight checks `flow-sim-rs simulate-sketch --help` for `--dump-translated` support and verifies the SyCCL `synthesize` binary.
@@ -340,6 +393,7 @@ Tests use `unittest` so they run in the existing agent virtual environment witho
 - Instruction and initial-program rendering.
 - Candidate selection ignores invalid results and deterministically chooses the lowest positive FlowSim time.
 - Manifest transitions, atomic writes, resume behavior, and `--force` behavior.
+- Search-attempt isolation and selection from exactly one attempt.
 - Incremental SyCCL `Time` extraction.
 
 ### Topology regression tests
@@ -377,7 +431,9 @@ The README includes one minimal example project and a checklist for topology, co
 
 ## Compatibility
 
-- The four existing preparation scripts remain byte-for-byte unchanged by this implementation.
+- The four existing preparation scripts remain byte-for-byte unchanged by this
+  implementation. The separately authorized V100 topology-template identifier
+  correction is not a change to those scripts.
 - Existing experiment outputs are read-only and are not migrated automatically.
 - The new bundle schema begins at version 1 and is independent of legacy manifests.
 - The new pipeline may read the same model configuration and evaluator implementation as existing scripts, but does not depend on their directory layouts.
