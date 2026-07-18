@@ -530,6 +530,8 @@ Assert the case directory contains `topodsl.py`, `config.json`, `instruction.txt
 
 Add a manifest-locking regression test with two worker processes, each using its own `ManifestStore` instance to increment a manifest counter repeatedly; the final value must equal the sum of both workers, proving the file lock prevents lost updates beyond one Python object.
 
+Assert the schema-v1 manifest includes creation/update timestamps, project source paths and SHA256 hashes, case input paths and hashes, both message-size representations, redacted resolved configuration, and complete pending stage records with timestamp/error/provenance fields initialized to `None`.
+
 - [ ] **Step 2: Run tests and verify failure**
 
 ```bash
@@ -552,6 +554,28 @@ class ManifestStore:
 
 Write JSON to `manifest.json.tmp`, flush and `os.fsync`, then `os.replace`. Reject a missing schema or unsupported schema version on load.
 Guard every read-modify-write operation with one process-local `threading.RLock` shared by the stage coordinator and an OS file lock on `manifest.lock`; atomic replacement alone does not prevent lost updates when `--jobs > 1` or two recovery commands overlap.
+
+Use this schema boundary:
+
+```text
+manifest
+  schema_version, project, launch_id, created_at, updated_at
+  sources.{topology,instruction,initial_program}.{path,sha256}
+  resolved_config                         # no secrets
+  cases.CASE_ID
+    scale, collective, total_message_size, coll_byte
+    inputs.{topodsl,config,instruction,init_program}.{path,sha256}
+    stages.search
+      status, latest_attempt, latest_successful_attempt
+      attempts[]                          # number/status/times/wall/exit/error/paths/redacted config
+    stages.selection
+      status, selected_attempt, score, times, error
+    stages.resim
+      status, times, wall_time_s, flow_exit_status, syccl_exit_status
+      flow_time_us, syccl_time_us, binaries, error
+```
+
+Every stage/attempt record uses UTC ISO-8601 timestamps, `error_category`, and a bounded `error_message`. Binary records contain resolved path and SHA256 when readable. Attempt records contain the redacted resolved model/API configuration and command-record path; API keys are represented only by `api_key_present: bool`.
 
 - [ ] **Step 4: Implement instruction and initial-program rendering**
 
@@ -632,6 +656,8 @@ self.assertNotIn("balance", command)
 
 Assert the first execution uses `search/attempt-0001`, a failed retry uses `attempt-0002`, a successful attempt is skipped without force, and `force=True` creates the next attempt without deleting earlier artifacts. Seed a successful selection/resim state before a forced successful search and assert both downstream stages become pending while the new attempt becomes `latest_successful_attempt`.
 
+Add an out-of-order completion test: allocate attempts 1 and 2 for the same case, finish attempt 2 successfully first, then finish attempt 1. Assert `latest_attempt == 2`, `latest_successful_attempt == 2`, search remains succeeded, and the older completion neither invalidates the attempt-2 selection nor overwrites attempt-2 status/error fields.
+
 - [ ] **Step 2: Run tests and verify failure**
 
 ```bash
@@ -642,7 +668,20 @@ Expected: ERROR because `llm_ccl.search` does not exist.
 
 - [ ] **Step 3: Implement model config, preflight, and command construction**
 
-Provide `SearchOptions` with model, API base/key, max tokens, generation counts, candidate count, evaluator/generation concurrency, LLM policy pool size, jobs, timeout, and force. Load optional `agent/env.toml` with `tomllib`; explicit CLI values override the file.
+Provide `SearchOptions` with model, API base/key, max tokens, generation counts, candidate count, evaluator/generation concurrency, LLM policy pool size, jobs, timeout, FlowSim path, and force.
+
+Resolve values in this exact order:
+
+```text
+model:       --model > MODEL_NAME > env.toml:model                 # required
+api_base:    --api-base > API_BASE > env.toml:api_base             # optional
+api_key:     --api-key > API_KEY > OPENAI_API_KEY > env.toml:api_key
+max_tokens:  --max-tokens > MAX_TOKENS > 32768
+flow_sim:    --flow-sim-bin > FLOW_SIM_BIN >
+             AGENT_ROOT/datasets/syccl/scheme1_direct_events/flow-sim-rs/target/release/flow-sim-rs
+```
+
+`--env-toml` defaults to `AGENT_ROOT / "env.toml"`; a missing file is allowed only when the required model resolves elsewhere. Parse environment numeric values with positive-integer validation. Explicit CLI values always win. Resolve relative CLI/environment paths against the invocation working directory; repository defaults are constructed from `AGENT_ROOT`/`REPO_ROOT` and therefore do not depend on the caller's directory.
 
 Before allocating an attempt, require a non-empty model name, readable case-local inputs, the repository `main.py` and evaluator, an executable `uv`, and an executable FlowSim binary. Build this exact SimpleTES command with case-local inputs and outputs, adding `--api-base`, `--api-key`, and `--max-tokens` only when configured:
 
@@ -682,7 +721,21 @@ Write a redacted `command.json`; never persist API keys in the manifest, command
 
 - [ ] **Step 4: Implement immutable attempt state**
 
-Before execution, atomically append a `running` attempt record. On completion, update only that attempt to `succeeded` or `failed`; set `latest_successful_attempt` only on success. A new success marks selection and resim pending with a stale reason, and resim must refuse old `best/` files until selection succeeds again. Use a `ThreadPoolExecutor(max_workers=jobs)` for independent selected cases and the locked shared `ManifestStore` for all transitions.
+Before execution, atomically allocate `attempt_number = latest_attempt + 1`, append its `running` record, and update `latest_attempt` under the same manifest lock. On completion, update only that numbered attempt.
+
+Recompute aggregate search state from attempt records instead of using completion order:
+
+```python
+succeeded = [a["number"] for a in attempts if a["status"] == "succeeded"]
+case_search["latest_successful_attempt"] = max(succeeded, default=None)
+case_search["status"] = (
+    "succeeded" if succeeded
+    else "running" if any(a["status"] == "running" for a in attempts)
+    else "failed"
+)
+```
+
+Invalidate selection/resim only when a success increases `latest_successful_attempt`; an older attempt finishing later cannot overwrite the pointer or invalidate artifacts selected from a newer attempt. The result of the current invocation still reports its own attempt failure even if an older success keeps aggregate search state usable. Use a `ThreadPoolExecutor(max_workers=jobs)` for independent selected cases and the locked shared `ManifestStore` for all transitions.
 
 - [ ] **Step 5: Run search tests**
 
@@ -785,6 +838,8 @@ Expected: ERROR because `llm_ccl.resim` does not exist.
 
 - [ ] **Step 3: Implement preflight**
 
+Provide `ResimOptions` with FlowSim path, synthesize path, timeout seconds, and force.
+
 Run:
 
 ```python
@@ -793,6 +848,17 @@ Run:
 
 Require successful exit and `--dump-translated` in combined output. Require `synthesize_bin.is_file()` and executable access. Record binary path and SHA256 when readable.
 Require selection stage status `succeeded`, verify `selection.json` matches the manifest's selected attempt, and verify that attempt is recorded as successful. Do not require it to equal `latest_successful_attempt`, because `select --attempt` intentionally supports replaying an older successful search.
+
+Resolve binaries in this exact order:
+
+```text
+flow_sim:   --flow-sim-bin > FLOW_SIM_BIN >
+            AGENT_ROOT/datasets/syccl/scheme1_direct_events/flow-sim-rs/target/release/flow-sim-rs
+synthesize: --synthesize-bin > SYNTHESIZE_BIN > REPO_ROOT/syccl/build/synthesize
+timeout:    --resim-timeout-seconds > SYCCL_RESIM_TIMEOUT_SECONDS > 3600
+```
+
+Relative CLI/environment paths are resolved against the invocation working directory before being stored; repository defaults are rooted explicitly. No inaccessible `/root/...` default is used.
 
 - [ ] **Step 4: Implement the two commands**
 
@@ -894,6 +960,23 @@ git commit -m "feat: report llm-ccl pipeline results"
 
 Assert the parser exposes `list`, `prepare`, `search`, `select`, `resim`, `report`, `status`, and `run`; `prepare`/`run` accept project, bundle root, launch ID, and repeated case filters; stage commands accept `--bundle`; `select` accepts `--attempt`; search, select, and resim accept `--force`.
 
+Assert these option groups and defaults:
+
+```text
+search:
+  --env-toml agent/env.toml
+  --model/--api-base/--api-key/--max-tokens
+  --max-generations 10000, --k-candidates 4
+  --eval-concurrency 1, --gen-concurrency 1
+  --llm-policy-pool-size 100, --jobs 1
+  --search-timeout-seconds 7200, --flow-sim-bin, --force
+resim:
+  --flow-sim-bin, --synthesize-bin
+  --resim-timeout-seconds 3600, --force
+run:
+  every search and resim option above except stage-only --force
+```
+
 - [ ] **Step 2: Write a failing fake-executable pipeline test**
 
 Build a one-case temporary project package and fake runner adapters so:
@@ -921,11 +1004,11 @@ Expected: ERROR because `run.py` does not exist.
 
 - [ ] **Step 4: Implement `run.py`**
 
-At startup, insert `agent/` and `agent/scripts/llm-ccl/` into `sys.path`. Build subparsers and delegate without embedding pipeline logic. `list` prints project name and case count. Resolve `--case` values against the project or bundle before launching stages. Return non-zero when any requested case fails.
+At startup, insert `agent/` and `agent/scripts/llm-ccl/` into `sys.path`. Build subparsers and delegate without embedding pipeline logic. `list` prints project name and case count. Resolve `--case` values against the project or bundle before launching stages. Map every CLI option into `SearchOptions` or `ResimOptions`; modules perform the environment/TOML/default resolution described above. Return non-zero when any requested case fails.
 
 - [ ] **Step 5: Implement `run` orchestration**
 
-`run` calls prepare, search, select, resim, and report in order using the newly created bundle. If search or selection fails for some cases, later stages continue only for eligible cases, reports are still written, and the final exit status is non-zero.
+`run` calls prepare, search, select, resim, and report in order using the newly created bundle. It forwards the same `--flow-sim-bin` override to search and resim (both modules use the identical environment/default fallback), forwards all model/search options only to search, and forwards the synthesize path plus resim timeout only to resim. If search or selection fails for some cases, later stages continue only for eligible cases, reports are still written, and the final exit status is non-zero.
 
 - [ ] **Step 6: Run CLI and pipeline tests**
 
