@@ -187,7 +187,9 @@ Message-size semantics have exactly one conversion:
   the collective.
 - `total_message_size` must be positive and divisible by `gpu_count`.
 - `syccl_agents.topodsl.load_topodsl` normalizes the rendered topology object to
-  `TopologyParams.message_size = total_message_size // gpu_count`.
+  `TopologyParams.message_size = total_message_size // gpu_count`. This is
+  existing behavior in `_normalize_params`; the new pipeline does not change
+  `syccl_agents.topodsl` to implement this conversion.
 - `syccl_agents.config_render` copies that normalized value into
   `config["coll"]["byte"]`; the pipeline must not divide it a second time.
 - Instruction rendering exposes `MESSAGE_SIZE` as the per-rank `coll.byte` and
@@ -298,10 +300,17 @@ python agent/scripts/llm-ccl/run.py run --project PROJECT [options]
 
 The default bundle destination is
 `experiments/llm-ccl/PROJECT/YYYYMMDD-HHMMSS/`. `prepare` and `run` accept
-`--bundle-root` and `--launch-id` to override it. Stage commands accept a
-repeatable `--case CASE_ID` filter; with no filter, they operate on every case
-in the bundle. `select` additionally accepts `--attempt N` when a specific
-successful search attempt must be selected.
+`--bundle-root` and `--launch-id` to override it. They reject an already
+existing destination rather than merging with or overwriting it; resuming an
+existing launch always uses a stage command with `--bundle`.
+
+`prepare` and `run` accept a repeatable `--case CASE_ID` to create and run a
+project subset. `search`, `select`, and `resim` accept the same filter for an
+existing bundle; with no filter they operate on every case. `status` may filter
+displayed cases. `report` always reports the full bundle and does not accept a
+case filter, so a partial report cannot silently overwrite the bundle-wide
+summary with a subset. `select` additionally accepts `--attempt N` when a
+specific successful search attempt must be selected.
 
 Binary and model configuration is supplied through explicit flags or environment/config files. New code must not probe inaccessible hard-coded `/root/...` paths at import time.
 
