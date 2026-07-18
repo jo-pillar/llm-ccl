@@ -33,8 +33,10 @@
 
 ### Existing files changed
 
+- `agent/datasets/syccl/scheme1_direct_events/templates/H800_multirail/multirail_topo.py`: capture the user's corrected flat-ID NVSwitch-star topology in the implementation history.
 - `agent/datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/clos_topo.py`: normalize host-local GPU identifiers to flat global IDs.
 - `agent/datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/prompt_template.txt`: remove duplicated stale numeric link descriptions; refer to the rendered topology as authority.
+- `agent/examples/topologies/clos_topo.py`: keep the shared example on the same flat-ID NVSwitch-star semantics.
 - `agent/tests/test_syccl_v100_dgx2_clos_experiment.py`: replace full-mesh connection invariants with star/NVSwitch invariants while preserving the legacy script's own generated link values.
 - `agent/tests/test_topology_examples.py`: replace full-mesh example invariants with star/NVSwitch invariants.
 
@@ -47,12 +49,14 @@ The four legacy preparation scripts are not modified.
 **Files:**
 - Create: `agent/scripts/llm-ccl/tests/__init__.py`
 - Create: `agent/scripts/llm-ccl/tests/test_topology_templates.py`
+- Modify: `agent/datasets/syccl/scheme1_direct_events/templates/H800_multirail/multirail_topo.py:21-31`
 - Modify: `agent/datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/clos_topo.py:24-35`
 - Modify: `agent/datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/prompt_template.txt:14-23`
+- Modify: `agent/examples/topologies/clos_topo.py:25-50`
 - Modify: `agent/tests/test_syccl_v100_dgx2_clos_experiment.py:57-82`
 - Modify: `agent/tests/test_topology_examples.py:13-25`
 
-- [ ] **Step 1: Write failing V100 template tests**
+- [ ] **Step 1: Write topology-template regression tests**
 
 ```python
 from __future__ import annotations
@@ -111,7 +115,9 @@ Run from `agent/`:
 
 Expected: FAIL because the current V100 NVSwitch edge uses `gpu[0][0]`.
 
-- [ ] **Step 3: Update the V100 topology and prompt**
+- [ ] **Step 3: Capture the corrected templates and update the V100 prompt**
+
+Keep the user's H800 `gpu[global_id] -> nvswitch[host_id]` implementation and include it in the Task 1 commit so a clean checkout does not revert to the old full mesh.
 
 Change the host-local source node to:
 
@@ -129,6 +135,8 @@ Replace the prompt's numeric interpretation bullets with topology-driven wording
 - Layers 2 and 3 describe the host NIC and leaf path; use their rendered link costs.
 - Layer 4 crosses the Clos spine; use its rendered bandwidth and latency.
 ```
+
+In `agent/examples/topologies/clos_topo.py`, keep the star structure but normalize both host-local and host-attachment GPU nodes to `gpu[{host_id * gpu_per_host + gpu_i}]` so the example does not retain a second identifier convention.
 
 - [ ] **Step 4: Update legacy regression tests to assert star structure**
 
@@ -149,6 +157,7 @@ For the example topology, assert:
 assert len(connections) == 138
 assert _count_edges(connections, "gpu[", "nvswitch[") == 64
 assert _count_edges(connections, "gpu[", "gpu[") == 0
+assert not any(re.fullmatch(r"gpu\[\d+\]\[\d+\]", node.node_id) for edge in connections for node in edge)
 ```
 
 - [ ] **Step 5: Run targeted topology tests**
@@ -166,8 +175,10 @@ Expected: all PASS.
 
 ```bash
 git add \
+  agent/datasets/syccl/scheme1_direct_events/templates/H800_multirail/multirail_topo.py \
   agent/datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/clos_topo.py \
   agent/datasets/syccl/scheme1_direct_events/templates/v100_dgx2_clos/prompt_template.txt \
+  agent/examples/topologies/clos_topo.py \
   agent/tests/test_syccl_v100_dgx2_clos_experiment.py \
   agent/tests/test_topology_examples.py \
   agent/scripts/llm-ccl/tests
@@ -221,6 +232,9 @@ class ModelTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "duplicate layer_id"):
       ScaleSpec("bad", 8, (LayerShape(1, 1, 8), LayerShape(1, 1, 8)))
 
+  def test_layer_zero_is_supported_for_existing_topodsl_templates(self):
+    self.assertEqual(0, LayerShape(0, 1, 8).layer_id)
+
   def test_case_rejects_non_divisible_total_message_size(self):
     scale = ScaleSpec("8gpu", 8, (LayerShape(1, 1, 8),))
     with self.assertRaisesRegex(ValueError, "divisible"):
@@ -246,7 +260,7 @@ Expected: ERROR because `llm_ccl.models` does not exist.
 `models.py` must provide:
 
 ```python
-_SLUG = re.compile(r"^[a-z0-9][a-z0-9._=-]*$")
+_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._=-]*$")
 _COLLECTIVES = {"allgather", "alltoall", "allreduce", "broadcast"}
 
 
@@ -257,8 +271,8 @@ class LayerShape:
   node_num: int
 
   def __post_init__(self) -> None:
-    if self.layer_id <= 0 or self.group_num <= 0 or self.node_num <= 0:
-      raise ValueError("layer_id, group_num, and node_num must be positive")
+    if self.layer_id < 0 or self.group_num <= 0 or self.node_num <= 0:
+      raise ValueError("layer_id must be non-negative; group_num and node_num must be positive")
 
 
 @dataclass(frozen=True)
@@ -514,6 +528,8 @@ self.assertEqual("pending", manifest["cases"][case_id]["stages"]["search"]["stat
 
 Assert the case directory contains `topodsl.py`, `config.json`, `instruction.txt`, and `init_program.py`; the config contains `coll.byte == 1024` and the V100 link values `0.15/3`, `0.0125/3`, `0.1/0.5`. Assert preparing into an existing launch directory raises `FileExistsError`.
 
+Add a manifest-locking regression test with two worker processes, each using its own `ManifestStore` instance to increment a manifest counter repeatedly; the final value must equal the sum of both workers, proving the file lock prevents lost updates beyond one Python object.
+
 - [ ] **Step 2: Run tests and verify failure**
 
 ```bash
@@ -666,7 +682,7 @@ Write a redacted `command.json`; never persist API keys in the manifest, command
 
 - [ ] **Step 4: Implement immutable attempt state**
 
-Before execution, atomically append a `running` attempt record. On completion, update only that attempt to `succeeded` or `failed`; set `latest_successful_attempt` only on success. A new success marks selection and resim pending with a stale reason, and resim must refuse old `best/` files until selection succeeds against that latest attempt. Use a `ThreadPoolExecutor(max_workers=jobs)` for independent selected cases and the locked shared `ManifestStore` for all transitions.
+Before execution, atomically append a `running` attempt record. On completion, update only that attempt to `succeeded` or `failed`; set `latest_successful_attempt` only on success. A new success marks selection and resim pending with a stale reason, and resim must refuse old `best/` files until selection succeeds again. Use a `ThreadPoolExecutor(max_workers=jobs)` for independent selected cases and the locked shared `ManifestStore` for all transitions.
 
 - [ ] **Step 5: Run search tests**
 
@@ -694,7 +710,7 @@ git commit -m "feat: run isolated llm-ccl search attempts"
 
 - [ ] **Step 1: Write failing selection tests**
 
-Create two successful attempt trees with FlowSim manifests and candidate artifacts. Give attempt 1 a faster stale candidate and attempt 2 two candidates with times `12.0` and `9.0`. Assert default selection chooses `9.0` from attempt 2, not the stale `5.0` from attempt 1. Add invalid zero/NaN/malformed-JSON/missing-output candidates and a deterministic path tie. Assert a successful selection is skipped by default, `force=True` replaces the mutable `best/` result, and an explicit different attempt requires force.
+Create two successful attempt trees with FlowSim manifests and candidate artifacts. Give attempt 1 a faster stale candidate and attempt 2 two candidates with times `12.0` and `9.0`. Assert default selection chooses `9.0` from attempt 2, not the stale `5.0` from attempt 1. Add invalid zero/NaN/malformed-JSON/missing-output candidates and a deterministic path tie. Assert a successful selection is skipped by default, `force=True` replaces the mutable `best/` result, and an explicit different successful attempt requires force. After force-selecting attempt 1, assert the manifest records attempt 1 as authoritative even though attempt 2 remains `latest_successful_attempt`; Task 8 verifies resim accepts it.
 
 - [ ] **Step 2: Run tests and verify failure**
 
@@ -723,7 +739,7 @@ Sort eligible candidates by `(time_us, source_path)`.
 
 - [ ] **Step 4: Implement selection output and invalidation**
 
-Copy the selected config/sketch to `best/`, write `selection.json` with attempt number, source paths, and score, set selection state to succeeded, and reset resim state to pending. Reject an explicit attempt that is not recorded as successful. Skip an already successful selection unless `force=True`; forced selection may atomically replace `best/` but never modifies a search attempt.
+Copy the selected config/sketch to `best/`, write `selection.json` with attempt number, source paths, and score, set selection state to succeeded, and reset resim state to pending. Reject an explicit attempt that is not recorded as successful. Skip an already successful selection unless `force=True`; forced selection may atomically replace `best/` but never modifies a search attempt. The selected attempt is authoritative for resim and may be older than `latest_successful_attempt`; any later successful search invalidates it again.
 
 - [ ] **Step 5: Run selection tests**
 
@@ -757,7 +773,7 @@ Use fake executable scripts under a temporary directory:
 - fake SyCCL writes a large-ish JSON file with an earlier nested `"Time"` and a top-level `"Time": 42.5`;
 - an unsupported FlowSim help output omits `--dump-translated`.
 
-Assert command order, output paths, parsed times, manifest success, skip behavior, force behavior, and unsupported-binary failure.
+Assert command order, output paths, parsed times, manifest success, skip behavior, force behavior, unsupported-binary failure, and acceptance of a valid explicitly selected older successful attempt.
 
 - [ ] **Step 2: Run tests and verify failure**
 
@@ -776,6 +792,7 @@ Run:
 ```
 
 Require successful exit and `--dump-translated` in combined output. Require `synthesize_bin.is_file()` and executable access. Record binary path and SHA256 when readable.
+Require selection stage status `succeeded`, verify `selection.json` matches the manifest's selected attempt, and verify that attempt is recorded as successful. Do not require it to equal `latest_successful_attempt`, because `select --attempt` intentionally supports replaying an older successful search.
 
 - [ ] **Step 4: Implement the two commands**
 
@@ -826,7 +843,7 @@ git commit -m "feat: run syccl resim for selected candidates"
 
 - [ ] **Step 1: Write failing report tests**
 
-Create a manifest with one successful case, one search failure, and one pending case. Assert `summary.json` and `summary.csv` contain all three cases, selected FlowSim time, resim FlowSim time, SyCCL time, attempt number, stage statuses, and error category. Assert status filtering affects display data only and does not rewrite reports.
+Create a manifest with one successful case, one search failure, and one pending case. Assert `summary.json` and `summary.csv` contain all three cases, selected FlowSim time, resim FlowSim time, SyCCL time, attempt number, stage statuses, and error category. Assert `summary.json` also contains aggregate counts for prepared, searched, selected, resimulated, and failed cases. Assert status filtering affects display data only and does not rewrite reports.
 
 - [ ] **Step 2: Run tests and verify failure**
 
@@ -841,12 +858,12 @@ Expected: ERROR because `llm_ccl.reporting` does not exist.
 Provide:
 
 ```python
-def build_summary(manifest: dict[str, Any]) -> list[dict[str, Any]]: ...
+def build_summary(manifest: dict[str, Any]) -> dict[str, Any]: ...
 def write_report(bundle: Path) -> tuple[Path, Path]: ...
 def status_rows(bundle: Path, case_ids: set[str] | None = None) -> list[dict[str, Any]]: ...
 ```
 
-Write reports atomically. Always include the full bundle in persisted reports. Keep CSV field order stable.
+Write reports atomically. Always include the full bundle in persisted reports. Keep CSV field order stable. Write `summary.json` as an object containing project/bundle metadata, `counts`, and `cases`; define counts as: prepared = all manifest cases, searched/selected/resimulated = cases whose respective stage succeeded, and failed = cases with any current stage in failed state.
 
 - [ ] **Step 4: Run report tests**
 
@@ -887,7 +904,8 @@ Build a one-case temporary project package and fake runner adapters so:
 4. fake FlowSim dumps a translated schedule;
 5. fake SyCCL writes `Time`;
 6. `report` writes one successful row;
-7. rerunning the full workflow skips successful stages.
+7. rerunning `search`, `select`, and `resim` against the existing bundle skips successful stages;
+8. rerunning `run` with the same project/launch destination returns non-zero, reports that the destination exists, and leaves it unchanged instead of silently resuming or overwriting.
 
 Add a two-case orchestration test where one fake search fails: the eligible case still reaches selection/resim, the report contains both cases, and the final command status is non-zero. Add a forced-rerun assertion proving search creates `attempt-0002`, selection consumes only that attempt, and resim reruns without deleting the earlier search attempt.
 
@@ -1006,7 +1024,7 @@ git status --short
 git diff --stat <pre-implementation-commit>..HEAD
 ```
 
-Confirm only intended new pipeline files, the V100 topology/prompt templates, and topology regression tests changed. Preserve all unrelated user changes.
+Confirm only intended new pipeline files, the captured H800/V100/example topology corrections, the V100 prompt template, and topology regression tests changed. Preserve all unrelated user changes.
 
 - [ ] **Step 6: Commit documentation**
 
@@ -1029,5 +1047,6 @@ git commit -m "docs: explain adding llm-ccl experiments"
 - [ ] FlowSim exports `translated.json` for the selected candidate.
 - [ ] SyCCL `resim` runs without SyCCL `solve`.
 - [ ] Reports cover every bundle case.
+- [ ] Reports include prepared, searched, selected, resimulated, and failed aggregate counts.
 - [ ] Existing successful stages resume without rerunning.
 - [ ] README documents how to add a new project without a central registry edit.
