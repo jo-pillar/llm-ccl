@@ -26,12 +26,11 @@ class DGX2ClosTopology(BaseTopology):
         gpu_per_host = self.gpu_num // host_local_spec.group_num
         assert gpu_per_host == host_local_spec.node_num, "Mismatch between GPU count and host-local specification."
         for host_id in range(host_local_spec.group_num):
-            host_base = host_id * gpu_per_host
-            for local_src in range(gpu_per_host):
-                for local_dst in range(local_src + 1, gpu_per_host):
-                    src_node = Node(node_id=f"gpu[{host_base + local_src}]", node_type=NodeType.GPU)
-                    dst_node = Node(node_id=f"gpu[{host_base + local_dst}]", node_type=NodeType.GPU)
-                    self.connect(src_node, dst_node, host_local_spec.link_spec)
+            # 同一主机内GPU通过nvswitch建立连接
+            for gpu_i in range(gpu_per_host):
+                src_node = Node(node_id=f"gpu[{host_id * gpu_per_host + gpu_i}]", node_type=NodeType.GPU)
+                dst_node = Node(node_id=f"nvswitch[{host_id}]", node_type=NodeType.SWITCH)
+                self.connect(src_node, dst_node, host_local_spec.link_spec)
 
     def f_gpu2hostnic(self):
         """Layer 2: all GPUs in a DGX-2 share its host NIC."""
@@ -82,9 +81,9 @@ topology = DGX2ClosTopology(
     64,
     65536,
     CollectiveType.ALLGATHER,
-    layer1=LayerSpec(1, LinkSpec("125GB/s", "3us"), group_num=4, node_num=16, node_type=NodeType.GPU),
+    layer1=LayerSpec(1, LinkSpec("150GB/s", "3us"), group_num=4, node_num=16, node_type=NodeType.GPU),
     layer2=LayerSpec(2, LinkSpec("12.5GB/s", "0us"), group_num=4, node_num=1, node_type=NodeType.NIC),
-    layer3=LayerSpec(3, LinkSpec("12.5GB/s", "25us"), group_num=4, node_num=1, node_type=NodeType.SWITCH),
-    layer4=LayerSpec(4, LinkSpec("400GB/s", "25us"), group_num=1, node_num=4, node_type=NodeType.SWITCH),
+    layer3=LayerSpec(3, LinkSpec("12.5GB/s", "3us"), group_num=4, node_num=1, node_type=NodeType.SWITCH),
+    layer4=LayerSpec(4, LinkSpec("100GB/s", "0.5us"), group_num=1, node_num=4, node_type=NodeType.SWITCH),
 )
 ###TopoEND

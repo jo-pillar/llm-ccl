@@ -1,61 +1,130 @@
-Optimize Collective sketch generation for a ${GPU_NUM} GPU cluster ${Collective} target.
+# Task: Optimize Collective Sketch Generation
 
-You are evolving Python code that returns one candidate single-root broadcast tree
-encoded as Concrete SketchDSL. The evaluator rotates that tree across all ${GPU_NUM} roots, expands
-it into the full ${Collective} event schedule, and evaluates it with flow-sim-rs.
+Optimize compact broadcast sketch generation for a `${GPU_NUM}`-GPU cluster targeting `${Collective}`.
 
-Optimization objective:
+You are evolving Python code that implements `construct_sketches()` and returns exactly **one** candidate single-root broadcast sketch in a compact DSL.
 
-    combined_score = coll.byte / simulated_time_us
+Return only Python code. Do not include explanations, Markdown, simulator calls, or multiple sketches.
 
-Higher `combined_score` is better. Since `coll.byte` is fixed for an experiment case,
-minimize the simulated `time_us` while avoiding contention after root rotation.
+## Core Idea
 
-Topology and link costs:
+Do **not** write a full `${Collective}` schedule directly.
+
+Your sketch only describes how the chunk initially owned by **GPU 0** is broadcast to every other GPU. The evaluator will validate the DSL, convert it into SyCCL sketch JSON, rotate the single-root tree across all `${GPU_NUM}` root GPUs, expand the result into full `${Collective}` direct events, and simulate the final GPU-to-GPU event schedule.
+
+A good sketch should be fast for the target collective  `${Collective}` after the same pattern is rotated across all roots.
+
+## Optimization Objective
+
+Maximize:
+
+```python
+combined_score = coll.byte / simulated_time_us
+```
+
+Since `coll.byte` is fixed, the practical objective is to minimize simulated `time_us`.
+
+## Topology
+
+- **Layer**: a distinct tier in the topology.
+- **Group**: a group under the same layer.
+- Nodes in the same layer/group can communicate through that layer.
+- Nodes in different groups must use other layers for connectivity.
+
+Topology and link specs:
+
+```text
 ${TOPOLOGY}
+```
 
 Interpretation:
-- Layer 1 is the 125 GB/s, 3 us DGX-2 host-local NVSwitch fabric. Use it for fanout among the 16 GPUs in one host.
-- Layers 2 and 3 use 100 Gbps (12.5 GB/s) NIC and leaf links; their configured latencies remain layer-specific.
-- Layer 4 uses a 400 GB/s leaf-to-spine link with 25 us latency.
-- Layer 2 describes GPU-to-NIC attachment and is not valid in Concrete SketchDSL.
-- Layer 3 describes GPUs grouped behind one Clos leaf. It can express leaf-local communication when a leaf contains multiple hosts.
-- Layer 4 crosses the Clos spine and is required for communication between DGX-2 hosts in this topology.
-- The rotated ${Collective} pattern should avoid serializing too many inter-host sends through the same relay.
 
-Required return format:
-- Implement `construct_sketches()`.
-- Return exactly one sketch, represented as a list of compact transmissions.
-- Preferred transmission form:
+- Layer 1, such as intra-host GPULINK, is fast and usually good for host-local fanout.
+- Layer 3 or 4, such as inter-host switch links, has lower bandwidth and nontrivial latency.
+- Avoid rotated `${Collective}` patterns that overload leaf links with serialized sends.
+- DO NOT use layer `2` in the DSL for this task. layer `2` is GPU-NIC link and will be rejected in DSL sketches.
+
+## Return Format
+
+Implement:
 
 ```python
-(step, layer, group, srcs, dsts)
+def construct_sketches():
+    ...
 ```
 
-- `srcs` and `dsts` may each be one integer GPU id or a flat list of integer GPU ids.
-- If `srcs` contains multiple GPUs, every source must already hold the chunk before that step.
-- Dict form is also accepted:
+Return one sketch as a list of compact transmissions.
+
+Preferred tuple form:
 
 ```python
-{"step": 0, "layer": 1, "group": 0, "srcs": [0], "dsts": [1, 2, 3]}
+(step, chunk, layer, group, srcs, dsts)
 ```
 
-Validity constraints:
-- Use only layers 1, 3, and 4. Never use layer 2.
-- A transmission's sources and destinations must all belong to the selected layer/group.
-- GPU ids must be integers in 0..${GPU_NUM}-1.
-- GPU 0 starts with the root chunk.
-- Every GPU 1..${GPU_NUM}-1 must be reached exactly once; GPU 0 must not be a destination.
-- A GPU may be a source only in a strictly later step than the step that first reaches it, except GPU 0.
-- No transmission may repeat a destination, and the full sketch may not deliver to one GPU twice.
+Dict form is also accepted:
 
-Design guidance:
-- Design a fast broadcast tree for root 0, then reason about contention when it is rotated across all roots.
-- Use NVSwitch fanout to create multiple local relays before crossing layer 4 where useful.
-- Balance the number and timing of cross-host sends against serialization on the single NIC per host.
-- Return only one sketch per generated program.
+```python
+{
+    "step": 0,
+    "chunk": 0,
+    "layer": 1,
+    "group": 0,
+    "srcs": [0],
+    "dsts": [1, 2, 3],
+}
+```
 
-Evaluator metrics:
-- `combined_score`: the only score to maximize.
-- `validity`: 1.0 for a valid sketch that simulates successfully, 0.0 otherwise.
-- `bottleneck_profile`: critical-flow-chain feedback for diagnosing serialization and link wait.
+`srcs` and `dsts` may be either a single GPU id or a list of GPU ids.
+
+If `srcs` contains multiple GPUs, all listed sources must already have the chunk before this step. During direct-event expansion, destinations are assigned across the listed sources in order, expressing parallel fanout from several relays inside one layer/group.
+
+## Validity Constraints
+
+- Use only layers `1` and `3`.
+- All `srcs` and `dsts` in a transmission must be inside the specified `layer/group`.
+- GPU ids must be integers in `0 .. ${GPU_NUM} - 1`.
+- GPU 0 starts with the root chunk and must not appear as a destination.
+- Every GPU from `1` to `${GPU_NUM} - 1` must be reached exactly once.
+- A GPU may be used as a source only after it received the chunk in an earlier step, except GPU 0.
+- Same-step forwarding through a newly reached GPU is invalid.
+- Dependent steps must be strictly increasing but independent steps do not need.
+- No transmission may contain duplicate destination ids.
+- No sketch may deliver to the same destination GPU more than once.
+
+## Design Guidance
+
+Think in two stages:
+
+1. Design an efficient broadcast tree for chunk 0.
+2. Reason about what happens when the same tree is rotated across all `${GPU_NUM}` chunks for `${Collective}`.
+
+Explore relay choices, fanout timing, dependency depth, multi-source fanout, and the balance between fast intra-host fanout and lower-contention inter-host communication.
+
+## Evaluator Metrics
+
+- `combined_score`: the primary score to maximize; equals `coll.byte / simulated_time_us`.
+- `validity`: `1.0` for a valid sketch that simulates successfully, `0.0` otherwise.
+- `bottleneck_profile`: diagnostic feedback describing bottleneck transmissions on the collective critical path.
+
+## Bottleneck Profile
+
+`bottleneck_profile` is an array where each element corresponds to one original sketch transmission, sorted by `transmission_index`.
+
+| Field | Meaning |
+|---|---|
+| `transmission_index` | Index of the transmission in the original sketch, used for stable sorting and locating the sketch entry. |
+| `sketch` | Human-readable transmission description, including `step`, `layer`, `group`, source GPU list, and destination GPU list. |
+| `profile_data` | Time breakdown and overall impact of this transmission on the bottleneck path. |
+| `propagation_delay_portion` | Percentage of this transmission's total time spent on propagation and fixed scheduling delay. |
+| `transmission_time_portion` | Detailed transmission-phase breakdown. Its subfields use the same total-time denominator as `propagation_delay_portion`. |
+| `serialize_time` | Percentage of this transmission's total time during which the link is actually transmitting data. |
+| `queue_wait` | Percentage of this transmission's total time spent waiting due to link or queue contention. |
+| `total_time_share` | Percentage of the full collective completion time accounted for by this transmission's total time. |
+
+For a nonzero-duration transmission:
+
+```text
+propagation_delay_portion + serialize_time + queue_wait = 100%
+```
+
+`serialize_time` and `queue_wait` are relative to the total time of this transmission, not only to `transmission_time_portion`.

@@ -24,12 +24,11 @@ class MultiRailTopology(BaseTopology):
         gpu_per_host = self.gpu_num // host_local_spec.group_num
         assert gpu_per_host == host_local_spec.node_num, "Mismatch between GPU count and Layer 0 node specification."
         for host_id in range(host_local_spec.group_num):
-                # 同一主机内GPU两两全连接（无重复）
-                for gpu_i in range(gpu_per_host):
-                    for gpu_j in range(gpu_i + 1, gpu_per_host):
-                        src_node = Node(node_id=f"gpu[{host_id*gpu_per_host + gpu_i}]", node_type=NodeType.GPU)
-                        dst_node = Node(node_id=f"gpu[{host_id*gpu_per_host + gpu_j}]", node_type=NodeType.GPU)
-                        self.connect(src_node, dst_node, host_local_spec.link_spec)
+            # 同一主机内GPU通过nvswitch建立连接
+            for gpu_i in range(gpu_per_host):
+                src_node = Node(node_id=f"gpu[{host_id*gpu_per_host + gpu_i}]", node_type=NodeType.GPU)
+                dst_node = Node(node_id=f"nvswitch[{host_id}]", node_type=NodeType.SWITCH)
+                self.connect(src_node, dst_node, host_local_spec.link_spec)
 
     def f_gpu2nic(self):
         host_local_spec = getattr(self, "layer_spec_1", None)
